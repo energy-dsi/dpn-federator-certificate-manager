@@ -24,6 +24,7 @@ application:
   oauth2:
     token-uri: ${OAUTH2_TOKEN_URI:https://localhost:8443/realms/mng-node/protocol/openid-connect/token}
     client-id: ${OAUTH2_CLIENT_ID:MANAGEMENT_NODE_CLIENT}
+    client-secret: ${OAUTH2_CLIENT_SECRET:MANAGEMENT_NODE_CLIENT_SECRET}
   management-node:
     base-url: ${MANAGEMENT_NODE_BASE_URL:https://localhost:8090}
   scheduling:
