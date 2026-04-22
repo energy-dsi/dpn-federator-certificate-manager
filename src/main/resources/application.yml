@@ -24,6 +24,7 @@ application:
   oauth2:
     token-uri: ${OAUTH2_TOKEN_URI:https://localhost:8443/realms/mng-node/protocol/openid-connect/token}
     client-id: ${OAUTH2_CLIENT_ID:MANAGEMENT_NODE_CLIENT}
+    client-secret: ${OAUTH2_CLIENT_SECRET:MANAGEMENT_NODE_CLIENT_SECRET}
   management-node:
     base-url: ${MANAGEMENT_NODE_BASE_URL:https://localhost:8090}
   scheduling:
@@ -31,7 +32,7 @@ application:
       renewal-rate: ${CERT_RENEWAL_RATE:3600000} # 1 hour in milliseconds
       sync-rate: ${CERT_SYNC_RATE:60000} # 1 minute in milliseconds
   certificate:
-    renewal-threshold-percentage: ${CERT_RENEWAL_THRESHOLD:10}
+    renewal-threshold-percentage: ${CERT_RENEWAL_THRESHOLD:100}
     key-size: ${CERT_KEY_SIZE:2048} # 2048 (standard), 4096 (higher security, slower TLS handshake)
     subject:
       country: ${CERT_SUBJECT_COUNTRY:UK}
@@ -41,7 +42,7 @@ application:
       organizational-unit: ${CERT_SUBJECT_OU:Platform Engineering}
       common-name: ${CERT_SUBJECT_CN:api.acme-digital.co.uk}
       # Alternative Names (DNS), comma-separated
-      alt-names: ${CERT_SUBJECT_ALT_NAMES:api.acme-digital.co.uk,api.internal.acme-digital.co.uk}
+      alt-names: ${CERT_SUBJECT_ALT_NAMES:api.acme-digital.co.uk,api.internal.acme-digital.co.uk,localhost}
     # Bootstrap detection: OID marker in certificate SANs
     bootstrap-oid: ${BOOTSTRAP_OID:1.3.6.1.4.1.32473.1.1}
     intermediate:

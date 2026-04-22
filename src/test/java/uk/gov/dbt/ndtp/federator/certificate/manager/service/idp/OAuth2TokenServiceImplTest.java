@@ -48,7 +48,7 @@ class OAuth2TokenServiceImplTest {
                         .body(any(ParameterizedTypeReference.class)))
                 .thenReturn(payload);
 
-        OAuth2TokenServiceImpl service = new OAuth2TokenServiceImpl(builder, "https://example/token", "CLIENT");
+        OAuth2TokenServiceImpl service = new OAuth2TokenServiceImpl(builder, "https://example/token", "CLIENT", "");
         service = spy(service);
         doReturn(restClient).when(service).buildRestClient(httpClient);
 
@@ -74,7 +74,7 @@ class OAuth2TokenServiceImplTest {
                         .body(any(ParameterizedTypeReference.class)))
                 .thenReturn(Collections.emptyMap());
 
-        OAuth2TokenServiceImpl service = new OAuth2TokenServiceImpl(builder, "https://example/token", "CLIENT");
+        OAuth2TokenServiceImpl service = new OAuth2TokenServiceImpl(builder, "https://example/token", "CLIENT", "");
         service = spy(service);
         doReturn(restClient).when(service).buildRestClient(httpClient);
 
@@ -97,7 +97,7 @@ class OAuth2TokenServiceImplTest {
                         .body(any(ParameterizedTypeReference.class)))
                 .thenReturn(null);
 
-        OAuth2TokenServiceImpl service = new OAuth2TokenServiceImpl(builder, "https://example/token", "CLIENT");
+        OAuth2TokenServiceImpl service = new OAuth2TokenServiceImpl(builder, "https://example/token", "CLIENT", "");
         service = spy(service);
         doReturn(restClient).when(service).buildRestClient(httpClient);
 
@@ -120,7 +120,7 @@ class OAuth2TokenServiceImplTest {
                         .body(any(ParameterizedTypeReference.class)))
                 .thenThrow(new RuntimeException("Network error"));
 
-        OAuth2TokenServiceImpl service = new OAuth2TokenServiceImpl(builder, "https://example/token", "CLIENT");
+        OAuth2TokenServiceImpl service = new OAuth2TokenServiceImpl(builder, "https://example/token", "CLIENT", "");
         service = spy(service);
         doReturn(restClient).when(service).buildRestClient(httpClient);
 
