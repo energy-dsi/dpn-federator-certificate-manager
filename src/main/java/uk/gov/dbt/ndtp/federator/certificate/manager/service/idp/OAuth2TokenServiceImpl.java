@@ -32,12 +32,14 @@ public class OAuth2TokenServiceImpl implements OAuth2TokenService {
     public static final String GRANT_TYPE = "grant_type";
     public static final String CLIENT_CREDENTIALS = "client_credentials";
     public static final String CLIENT_ID = "client_id";
+    public static final String CLIENT_SECRET = "client_secret";
     public static final String ACCESS_TOKEN = "access_token";
     public static final String EXPIRES_IN = "expires_in";
 
     private final MtlsHttpClientBuilder httpClientBuilder;
     private final String tokenUri;
     private final String clientId;
+    private final String clientSecret;
 
     /**
      * Constructs the OAuth2TokenServiceImpl.
@@ -49,10 +51,12 @@ public class OAuth2TokenServiceImpl implements OAuth2TokenService {
     public OAuth2TokenServiceImpl(
             MtlsHttpClientBuilder httpClientBuilder,
             @Value("${application.oauth2.token-uri}") String tokenUri,
-            @Value("${application.oauth2.client-id}") String clientId) {
+            @Value("${application.oauth2.client-id}") String clientId,
+            @Value("${application.oauth2.client-secret}") String clientSecret) {
         this.httpClientBuilder = httpClientBuilder;
         this.tokenUri = tokenUri;
         this.clientId = clientId;
+        this.clientSecret = clientSecret;
     }
 
     /**
@@ -69,6 +73,7 @@ public class OAuth2TokenServiceImpl implements OAuth2TokenService {
         MultiValueMap<String, String> formData = new LinkedMultiValueMap<>();
         formData.add(GRANT_TYPE, CLIENT_CREDENTIALS);
         formData.add(CLIENT_ID, clientId);
+        formData.add(CLIENT_SECRET, clientSecret);
 
         try (CloseableHttpClient httpClient = httpClientBuilder.buildHttpClient()) {
             RestClient restClient = buildRestClient(httpClient);
