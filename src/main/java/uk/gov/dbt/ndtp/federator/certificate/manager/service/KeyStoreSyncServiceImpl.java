@@ -115,7 +115,7 @@ public class KeyStoreSyncServiceImpl implements KeyStoreSyncService {
         } else {
             log.debug("Keystore at {} is already in sync with Vault. Skipping update.", keystorePath);
         }
-        writePasswordToFile(keystorePath, config.getKeystorePasswordFile(), keystorePassword);
+
     }
 
     private void syncTrustStore(
@@ -135,7 +135,6 @@ public class KeyStoreSyncServiceImpl implements KeyStoreSyncService {
         } else {
             log.debug("Truststore at {} is already in sync with Vault. Skipping update.", truststorePath);
         }
-        writePasswordToFile(truststorePath, config.getTruststorePasswordFile(), truststorePassword);
     }
 
     private boolean shouldUpdateKeyStore(
