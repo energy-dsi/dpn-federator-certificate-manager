@@ -142,8 +142,7 @@ class KeyStoreSyncServiceImplTest {
 
         assertTrue(Files.exists(tempDir.resolve("keystore.p12")));
         assertTrue(Files.exists(tempDir.resolve("truststore.p12")));
-        assertTrue(Files.exists(tempDir.resolve("keystore.password")));
-        assertTrue(Files.exists(tempDir.resolve("truststore.password")));
+
     }
 
     @Test
@@ -424,12 +423,12 @@ class KeyStoreSyncServiceImplTest {
         assertNotNull(ex.getCause());
     }
 
-    // --- writePasswordToFile: FileSystemException ---
 
     @Test
-    void syncKeyStoresToFilesystem_propagatesFileSystemExceptionFromPasswordWrite() {
+    void syncKeyStoresToFilesystem_succeedsWithoutPasswordWrite() {
         FileSystemService mockFs = mock(FileSystemService.class);
-        KeyStoreSyncServiceImpl serviceWithMockFs =
+
+        KeyStoreSyncServiceImpl service =
                 new KeyStoreSyncServiceImpl(certificateProperties, vaultSecretProvider, keyStoreService, mockFs);
 
         CreateKeyResponseDTO keyPair = CreateKeyResponseDTO.builder()
@@ -440,16 +439,20 @@ class KeyStoreSyncServiceImplTest {
         when(vaultSecretProvider.getCertificate()).thenReturn(certPem);
         when(vaultSecretProvider.getKeyPair()).thenReturn(keyPair);
         when(vaultSecretProvider.getCaChain()).thenReturn(List.of(caPem));
+
         when(keyStoreService.createKeyStore(anyString(), anyString(), any(), anyString(), anyString()))
                 .thenReturn(validKeystoreBytes);
-        when(mockFs.needsUpdate(any(), any())).thenReturn(true);
+
+        when(keyStoreService.createTrustStore(any(), anyString(), any()))
+                .thenReturn(validTruststoreBytes);
+
         doNothing().when(mockFs).atomicWrite(any(), any());
-        doThrow(new FileSystemException("disk full")).when(mockFs).write(any(), any());
 
-        FileSystemException ex = assertThrows(FileSystemException.class, serviceWithMockFs::syncKeyStoresToFilesystem);
+        // No write() mocking needed anymore
 
-        assertEquals("disk full", ex.getMessage());
+        assertDoesNotThrow(service::syncKeyStoresToFilesystem);
     }
+
 
     // --- shouldUpdateKeyStore edge cases ---
 

@@ -248,27 +248,6 @@ public class KeyStoreSyncServiceImpl implements KeyStoreSyncService {
         return Base64.getEncoder().encodeToString(bytes);
     }
 
-    private void writePasswordToFile(Path storePath, String passwordFileName, String password) {
-        Path parentDir = storePath.getParent();
-        if (parentDir == null) {
-            parentDir = Paths.get(".");
-        }
-        Path passwordFile = parentDir.resolve(passwordFileName);
-
-        byte[] newPasswordBytes = password.getBytes(StandardCharsets.UTF_8);
-        try {
-            if (fileSystemService.needsUpdate(passwordFile, newPasswordBytes)) {
-                fileSystemService.write(passwordFile, newPasswordBytes);
-                log.info("Password written to {}", passwordFile);
-            } else {
-                log.debug("Password file at {} is already in sync. Skipping update.", passwordFile);
-            }
-        } catch (FileSystemException e) {
-            log.error("Failed to write password file to {}", passwordFile, e);
-            throw e;
-        }
-    }
-
     private void validateKeyStore(byte[] bytes, String password, String alias) {
         try {
             KeyStore ks = KeyStore.getInstance(PKCS_12);
