@@ -161,6 +161,8 @@ class CertificateManagerServiceImplTest {
         certificateManagerService.renewCertificate();
 
         verify(vaultSecretProvider, never()).persistCertificate(any());
+        // key fix: key pair must NOT be persisted when signing fails
+        verify(vaultSecretProvider, never()).persistKeyPair(any());
     }
 
     @Test
@@ -180,6 +182,8 @@ class CertificateManagerServiceImplTest {
         certificateManagerService.renewCertificate();
 
         verify(vaultSecretProvider, never()).persistCertificate(any());
+        // key fix: key pair must NOT be persisted when signed cert is blank
+        verify(vaultSecretProvider, never()).persistKeyPair(any());
     }
 
     @Test
@@ -200,6 +204,8 @@ class CertificateManagerServiceImplTest {
         certificateManagerService.renewCertificate();
 
         verify(vaultSecretProvider, never()).persistCertificate(any());
+        // key fix: key pair must NOT be persisted when cert verification fails
+        verify(vaultSecretProvider, never()).persistKeyPair(any());
     }
 
     @Test
@@ -219,6 +225,8 @@ class CertificateManagerServiceImplTest {
 
         certificateManagerService.renewCertificate();
 
+        // key pair and cert persisted together
+        verify(vaultSecretProvider, times(1)).persistKeyPair(keyPair);
         verify(vaultSecretProvider, times(1)).persistCertificate("cert-pem");
     }
 
@@ -242,9 +250,30 @@ class CertificateManagerServiceImplTest {
 
         certificateManagerService.renewCertificate();
 
+        verify(vaultSecretProvider, times(1)).persistKeyPair(keyPair);
         verify(vaultSecretProvider, times(1)).persistCertificate("cert-pem");
         verify(vaultSecretProvider, never()).persistCaChain(any());
         verify(vaultSecretProvider, never()).persistIntermediateCa(any());
+    }
+
+    @Test
+    void renewCertificate_doesNotPersistKeyPairWhenSigningFails() {
+        // This is the core regression test for the fix.
+        // Before the fix, persistKeyPair was called immediately in generateAndPersistKeyPair(),
+        // leaving Vault with a new key pair that no certificate would ever match.
+        CreateKeyResponseDTO keyPair = CreateKeyResponseDTO.builder()
+                .publicKeyPem("pub").privateKeyPem("priv").build();
+        CreateCsrResponseDTO csr = new CreateCsrResponseDTO("id", "csr-pem");
+
+        when(pkiService.createKeyPair(null, 2048)).thenReturn(keyPair);
+        when(pkiService.createCsr(any())).thenReturn(csr);
+        when(managementNodeService.signCertificate(any())).thenReturn(null); // MN down
+
+        certificateManagerService.renewCertificate();
+
+        // Vault must be completely untouched — old cert stays valid, auth continues
+        verify(vaultSecretProvider, never()).persistKeyPair(any());
+        verify(vaultSecretProvider, never()).persistCertificate(any());
     }
 
     @Test
@@ -533,7 +562,7 @@ class CertificateManagerServiceImplTest {
         ContentSigner signer = new JcaContentSignerBuilder("SHA256withRSA").build(kp.getPrivate());
 
         DERSequence otherNameSeq = new DERSequence(new ASN1Encodable[] {
-            new ASN1ObjectIdentifier(oid), new DERTaggedObject(true, 0, new DERUTF8String(value))
+                new ASN1ObjectIdentifier(oid), new DERTaggedObject(true, 0, new DERUTF8String(value))
         });
         GeneralName otherName = new GeneralName(GeneralName.otherName, otherNameSeq);
         GeneralNames sans = new GeneralNames(otherName);
