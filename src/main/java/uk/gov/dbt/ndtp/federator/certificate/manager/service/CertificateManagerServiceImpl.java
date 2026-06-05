@@ -140,7 +140,7 @@ public class CertificateManagerServiceImpl implements CertificateManagerService 
     void renewCertificate() {
         log.info(RENEW_LOG_MSG);
 
-        CreateKeyResponseDTO keyPair = generateAndPersistKeyPair();
+        CreateKeyResponseDTO keyPair = generateKeyPair();
         if (keyPair == null) {
             log.warn("Key pair generation returned null; skipping CSR creation and signing.");
             return;
@@ -158,16 +158,18 @@ public class CertificateManagerServiceImpl implements CertificateManagerService 
             return;
         }
 
-        persistSignedArtifacts(signed);
+        // Signing succeeded — persist key pair and certificate together
+        persistSignedArtifacts(keyPair, signed);
         log.info("Certificate renewal completed successfully.");
     }
 
-    private CreateKeyResponseDTO generateAndPersistKeyPair() {
-        CreateKeyResponseDTO keyPairDto = pkiService.createKeyPair(null, certificateProperties.getKeySize());
-        if (keyPairDto != null) {
-            vaultSecretProvider.persistKeyPair(keyPairDto);
-        }
-        return keyPairDto;
+    /**
+     * Generates a new RSA key pair in memory only. Does not write to Vault.
+     * The key pair is passed through the renewal flow and only persisted once
+     * a matching signed certificate has been obtained.
+     */
+    private CreateKeyResponseDTO generateKeyPair() {
+        return pkiService.createKeyPair(null, certificateProperties.getKeySize());
     }
 
     private CreateCsrResponseDTO createCsr(CreateKeyResponseDTO keyPairDto) {
@@ -205,7 +207,7 @@ public class CertificateManagerServiceImpl implements CertificateManagerService 
                 SignCertRequestDTO.builder().csr(csrResp.getCsrPem()).build());
     }
 
-    private void persistSignedArtifacts(SignCertResponseDTO signResp) {
+    private void persistSignedArtifacts(CreateKeyResponseDTO keyPair, SignCertResponseDTO signResp) {
         String certificate = signResp.getCertificate();
         if (certificate == null || certificate.isBlank()) {
             log.warn("Signed certificate is null/blank; skipping certificate validation and persistence.");
@@ -214,6 +216,8 @@ public class CertificateManagerServiceImpl implements CertificateManagerService 
 
         if (!isSignedCertificateValid(certificate)) return;
 
+        // Key pair and certificate are always persisted together — one cannot exist without the other
+        vaultSecretProvider.persistKeyPair(keyPair);
         vaultSecretProvider.persistCertificate(certificate);
         persistCaChain(signResp);
         persistIntermediateCert(signResp);
