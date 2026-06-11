@@ -12,6 +12,7 @@ import java.util.Map;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
@@ -25,9 +26,16 @@ import uk.gov.dbt.ndtp.federator.certificate.manager.exception.OAuth2TokenExcept
 /**
  * Service for requesting OAuth2 tokens from Keycloak using client credentials grant.
  * Communication is secured via mTLS.
+ *
+ * <p>This implementation is active when {@code idp.auth.mode} is set to
+ * {@code client_credentials} or when the property is absent (default).</p>
  */
 @Slf4j
 @Service
+@ConditionalOnProperty(
+        name = "application.oauth2.auth-mode",
+        havingValue = "client_credentials",
+        matchIfMissing = true)
 public class OAuth2TokenServiceImpl implements OAuth2TokenService {
     public static final String GRANT_TYPE = "grant_type";
     public static final String CLIENT_CREDENTIALS = "client_credentials";
@@ -47,6 +55,7 @@ public class OAuth2TokenServiceImpl implements OAuth2TokenService {
      * @param httpClientBuilder a builder which can create instances of {@link CloseableHttpClient}
      * @param tokenUri the URI for requesting the token
      * @param clientId the OAuth2 client identifier
+     * @param clientSecret the OAuth2 client secret
      */
     public OAuth2TokenServiceImpl(
             MtlsHttpClientBuilder httpClientBuilder,
