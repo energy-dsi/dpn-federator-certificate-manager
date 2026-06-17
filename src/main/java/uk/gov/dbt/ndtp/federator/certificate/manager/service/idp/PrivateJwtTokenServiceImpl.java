@@ -18,16 +18,15 @@ import java.io.FileInputStream;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.security.KeyStore;
+import java.security.MessageDigest;
 import java.security.PrivateKey;
 import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
 import java.security.interfaces.ECPrivateKey;
 import java.security.interfaces.RSAPrivateKey;
 import java.time.Instant;
-import java.util.Date;
-import java.util.Map;
-import java.util.Objects;
-import java.util.UUID;
+import java.util.*;
+
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
@@ -326,7 +325,11 @@ public class PrivateJwtTokenServiceImpl implements OAuth2TokenService {
      */
     static String deriveKidFromCertificate(X509Certificate cert) {
         try {
-            String kid = RSAKey.parse(cert).computeThumbprint("SHA-256").toString();
+
+            byte[] der    = cert.getEncoded();
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(der);
+            String kid = base64url(digest);
+//                    RSAKey.parse(cert).computeThumbprint("SHA-256").toString();
             log.debug("Derived kid from certificate SHA-256 thumbprint: '{}'", kid);
             return kid;
         } catch (Exception e) {
@@ -334,6 +337,10 @@ public class PrivateJwtTokenServiceImpl implements OAuth2TokenService {
                     "Failed to derive kid from certificate SHA-256 thumbprint. "
                             + "Ensure the keystore contains an RSA certificate at the configured alias.", e);
         }
+    }
+
+    private static String base64url(byte[] bytes) {
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
     }
 
     private static JWSAlgorithm resolveAlgorithm(String alg) {
