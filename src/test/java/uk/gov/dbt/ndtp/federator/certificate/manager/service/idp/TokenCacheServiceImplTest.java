@@ -125,4 +125,41 @@ class TokenCacheServiceImplTest {
         assertThrows(OAuth2TokenException.class, () -> cacheService.refreshToken());
         verify(tokenService).getAccessToken();
     }
+
+    @Test
+    void refreshToken_doesNotEvictCache_whenCacheIsNullOnFailure() {
+        // Cache is null when failure occurs — evict() must not be called (no NullPointerException).
+        when(tokenService.getAccessToken()).thenThrow(new OAuth2TokenException("fail"));
+        when(cacheManager.getCache(CacheConfig.TOKEN_CACHE)).thenReturn(null);
+
+        assertThrows(OAuth2TokenException.class, () -> cacheService.refreshToken());
+        verify(cache, never()).evict(any());
+    }
+
+    @Test
+    void tokenService_canBePrivateJwtImpl_viaInterface() {
+        // Verifies TokenCacheServiceImpl accepts PrivateJwtTokenServiceImpl through the
+        // OAuth2TokenService interface — the @ConditionalOnProperty wiring intent.
+        OAuth2TokenService privateJwtDelegate = mock(PrivateJwtTokenServiceImpl.class);
+        TokenCacheServiceImpl service = new TokenCacheServiceImpl(privateJwtDelegate, cacheManager);
+
+        when(cache.get("currentToken", TokenResponse.class)).thenReturn(null);
+        when(privateJwtDelegate.getAccessToken()).thenReturn(new TokenResponse("jwt-token", 600));
+
+        assertEquals("jwt-token", service.getToken());
+        verify(privateJwtDelegate).getAccessToken();
+    }
+
+    @Test
+    void tokenService_canBeOAuth2TokenServiceImpl_viaInterface() {
+        // Verifies TokenCacheServiceImpl accepts OAuth2TokenServiceImpl through the interface.
+        OAuth2TokenService clientCredentialsDelegate = mock(OAuth2TokenServiceImpl.class);
+        TokenCacheServiceImpl service = new TokenCacheServiceImpl(clientCredentialsDelegate, cacheManager);
+
+        when(cache.get("currentToken", TokenResponse.class)).thenReturn(null);
+        when(clientCredentialsDelegate.getAccessToken()).thenReturn(new TokenResponse("cc-token", 600));
+
+        assertEquals("cc-token", service.getToken());
+        verify(clientCredentialsDelegate).getAccessToken();
+    }
 }
