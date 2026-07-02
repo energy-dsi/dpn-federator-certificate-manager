@@ -6,6 +6,8 @@
 
 package uk.gov.dbt.ndtp.federator.certificate.manager.job;
 
+import io.micrometer.observation.Observation;
+import io.micrometer.observation.ObservationRegistry;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -21,6 +23,7 @@ import uk.gov.dbt.ndtp.federator.certificate.manager.service.CertificateManagerS
 public class CertificateSyncJob {
 
     private final CertificateManagerService certificateManagerService;
+    private final ObservationRegistry observationRegistry;
 
     /**
      * Periodically executed task to synchronize on-disk keystores and truststores with Vault.
@@ -30,10 +33,14 @@ public class CertificateSyncJob {
             initialDelayString = "${application.scheduling.certificate-manager.sync-initial-delay:5000}")
     public void execute() {
         log.debug("Executing Certificate Sync Job");
-        try {
-            certificateManagerService.sync();
-        } catch (Exception e) {
-            log.error("Error during certificate synchronization job execution: {}", e.getMessage(), e);
-        }
+        // See CertificateRenewalJob for the rationale on wrapping with Observation.observe(...).
+        // Original try/catch preserved unchanged inside the observed block.
+        Observation.createNotStarted("certificate.sync", observationRegistry).observe(() -> {
+            try {
+                certificateManagerService.sync();
+            } catch (Exception e) {
+                log.error("Error during certificate synchronization job execution: {}", e.getMessage(), e);
+            }
+        });
     }
 }
