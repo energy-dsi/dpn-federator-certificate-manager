@@ -6,6 +6,8 @@
 
 package uk.gov.dbt.ndtp.federator.certificate.manager.job;
 
+import io.micrometer.observation.Observation;
+import io.micrometer.observation.ObservationRegistry;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -21,6 +23,7 @@ import uk.gov.dbt.ndtp.federator.certificate.manager.service.CertificateManagerS
 public class CertificateRenewalJob {
 
     private final CertificateManagerService certificateManagerService;
+    private final ObservationRegistry observationRegistry;
 
     /**
      * Periodically executed task to check certificate status and initiate renewal if necessary.
@@ -30,10 +33,17 @@ public class CertificateRenewalJob {
             initialDelayString = "${application.scheduling.certificate-manager.renewal-initial-delay:10000}")
     public void execute() {
         log.debug("Executing Certificate Renewal Job");
-        try {
-            certificateManagerService.run();
-        } catch (Exception e) {
-            log.error("Error during certificate renewal job execution: {}", e.getMessage(), e);
-        }
+        // Observation.observe(...) creates a span (via the OTel bridge, see pom.xml/application.yml)
+        // around the exact same call below; trace_id/span_id are then populated into MDC for
+        // every log line emitted inside certificateManagerService.run() - no changes needed
+        // there. The original try/catch is preserved unchanged inside the observed block, so
+        // error handling behaviour is identical to before this change.
+        Observation.createNotStarted("certificate.renewal", observationRegistry).observe(() -> {
+            try {
+                certificateManagerService.run();
+            } catch (Exception e) {
+                log.error("Error during certificate renewal job execution: {}", e.getMessage(), e);
+            }
+        });
     }
 }
