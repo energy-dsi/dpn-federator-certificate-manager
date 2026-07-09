@@ -84,8 +84,8 @@ class KeyStoreSyncServiceImplTest {
         dest.setKeystoreAlias("federator");
         dest.setKeystorePassword("ks-pass");
         dest.setTruststorePassword("ts-pass");
-        dest.setKeystorePasswordFile("keystore.pass");
-        dest.setTruststorePasswordFile("truststore.pass");
+        dest.setKeystorePasswordFile("keystore.password");
+        dest.setTruststorePasswordFile("truststore.password");
 
         keyStoreSyncService = new KeyStoreSyncServiceImpl(
                 certificateProperties, vaultSecretProvider, keyStoreService, realFileSystemService);
@@ -149,8 +149,8 @@ class KeyStoreSyncServiceImplTest {
     void syncKeyStoresToFilesystem_skipsUpdateWhenInSync() throws Exception {
         Files.write(tempDir.resolve("keystore.p12"), validKeystoreBytes);
         Files.write(tempDir.resolve("truststore.p12"), validTruststoreBytes);
-        Files.write(tempDir.resolve("keystore.pass"), "ks-pass".getBytes());
-        Files.write(tempDir.resolve("truststore.pass"), "ts-pass".getBytes());
+        Files.write(tempDir.resolve("keystore.password"), "ks-pass".getBytes());
+        Files.write(tempDir.resolve("truststore.password"), "ts-pass".getBytes());
 
         CreateKeyResponseDTO keyPair = CreateKeyResponseDTO.builder()
                 .publicKeyPem("pub")
