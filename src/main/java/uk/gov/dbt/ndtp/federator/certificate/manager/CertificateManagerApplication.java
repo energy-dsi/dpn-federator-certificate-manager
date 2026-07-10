@@ -6,6 +6,7 @@
 
 package uk.gov.dbt.ndtp.federator.certificate.manager;
 
+import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
@@ -18,6 +19,23 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 @SpringBootApplication
 public class CertificateManagerApplication {
     public static final String STARTING_MSG = "Starting federator Certificate Management service";
+
+    @PostConstruct
+    public void testLog() {
+        log.info("OTEL_LOG_TEST_123");
+    }
+
+//    @PostConstruct
+//    public void testOtelSdk() {
+//        Logger logger =
+//                GlobalOpenTelemetry.get()
+//                        .getLogsBridge()
+//                        .get("sdk-test");
+//
+//        logger.logRecordBuilder()
+//                .setBody("SDK_DIRECT_TEST_123")
+//                .emit();
+//    }
 
     /**
      * The main entry point for the application.
