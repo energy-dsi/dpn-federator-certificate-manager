@@ -174,3 +174,5 @@ public class OtelJsonEncoder extends EncoderBase<ILoggingEvent> {
         this.serviceVersion = serviceVersion;
     }
 }
+
+

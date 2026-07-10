@@ -5,6 +5,7 @@
   ~ attributed to the Department for Business and Trade (UK) as the governing entity.
   -->
 <configuration>
+    <statusListener class="ch.qos.logback.core.status.OnConsoleStatusListener"/>
 
     <!-- Standard Spring Boot include - keeps Spring's own default console conversion rules
          (colour conversion words etc.) available even though we don't use the default pattern
@@ -35,8 +36,24 @@
         </encoder>
     </appender>
 
+    <!-- Exports log records to the OTLP Collector. The OpenTelemetry SDK/exporter is wired to
+         this appender at runtime by OpenTelemetryLogsConfig via OpenTelemetryAppender.install();
+         until that call runs the appender has no SDK and drops logs, so both must be present.
+         trace_id/span_id are attached automatically from the active span; captureMdcAttributes
+         additionally carries this project's custom clientId MDC field onto the exported record.
+         captureKeyValuePairAttributes carries SLF4J 2.x addKeyValue(...) pairs onto the record -
+         this is what makes HeartbeatEmitter's event.name / component.name / component.status /
+         heartbeat.* attributes reach the otel-logs topic, so the health-monitoring dashboard's
+         Component/Pipeline Health panels can see them. Matches the federator's OTEL appender. -->
+    <appender name="OTEL" class="io.opentelemetry.instrumentation.logback.appender.v1_0.OpenTelemetryAppender">
+        <captureExperimentalAttributes>true</captureExperimentalAttributes>
+        <captureKeyValuePairAttributes>true</captureKeyValuePairAttributes>
+        <captureMdcAttributes>clientId</captureMdcAttributes>
+    </appender>
+
     <root level="INFO">
-        <appender-ref ref="JSON_CONSOLE"/>
+        <appender-ref ref="OTEL"/>
+        <appender-ref ref="PLAIN_CONSOLE"/>
     </root>
 
 </configuration>

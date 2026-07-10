@@ -148,3 +148,8 @@ management:
   observations:
     key-values:
       service.name: ${OTEL_SERVICE_NAME:certificate-manager}
+otel:
+  logs:
+    endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4318}/v1/logs
+  heartbeat:
+    interval-seconds: ${OTEL_HEARTBEAT_INTERVAL_SECONDS:900}
