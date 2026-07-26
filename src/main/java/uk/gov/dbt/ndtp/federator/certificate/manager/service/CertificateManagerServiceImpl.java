@@ -36,7 +36,6 @@ public class CertificateManagerServiceImpl implements CertificateManagerService 
     private final PkiService pkiService;
     private final VaultSecretProvider vaultSecretProvider;
     private final CertificateProperties certificateProperties;
-    private final KeyStoreSyncService keyStoreSyncService;
 
     /**
      * Periodically executed task to check certificate status and initiate renewal if necessary.
@@ -71,14 +70,6 @@ public class CertificateManagerServiceImpl implements CertificateManagerService 
                         daysLeft);
             }
         }
-    }
-
-    /**
-     * Periodically executed task to synchronize on-disk keystores and truststores with Vault.
-     */
-    @Override
-    public void sync() {
-        keyStoreSyncService.syncKeyStoresToFilesystem();
     }
 
     private static String getExpiryDateString(String currentCert) {

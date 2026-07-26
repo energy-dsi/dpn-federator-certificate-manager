@@ -1,110 +1,99 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ * © Crown Copyright 2026. This work has been developed by the National Digital Twin Programme and is legally
+ * attributed to the Department for Business and Trade (UK) as the governing entity.
+ */
+
 package uk.gov.dbt.ndtp.federator.certificate.manager.service.idp;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
-import com.nimbusds.jwt.SignedJWT;
-import java.nio.file.Path;
-import java.security.KeyStore;
+import java.math.BigInteger;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
 import java.security.MessageDigest;
+import java.security.PrivateKey;
+import java.security.PublicKey;
 import java.security.cert.X509Certificate;
 import java.util.Base64;
+import java.util.Date;
 import java.util.Map;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
+import org.bouncycastle.asn1.x500.X500Name;
+import org.bouncycastle.cert.X509v3CertificateBuilder;
+import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
+import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder;
+import org.bouncycastle.operator.ContentSigner;
+import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.io.TempDir;
-import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.MediaType;
 import org.springframework.web.client.RestClient;
 import uk.gov.dbt.ndtp.federator.certificate.manager.client.MtlsHttpClientBuilder;
-import uk.gov.dbt.ndtp.federator.certificate.manager.config.CertificateProperties;
 import uk.gov.dbt.ndtp.federator.certificate.manager.exception.OAuth2TokenException;
+import uk.gov.dbt.ndtp.federator.certificate.manager.model.dto.CreateKeyResponseDTO;
 import uk.gov.dbt.ndtp.federator.certificate.manager.service.pki.VaultSecretProvider;
+import uk.gov.dbt.ndtp.federator.certificate.manager.service.pki.cryptography.PemUtil;
 
 /**
  * Unit tests for {@link PrivateJwtTokenServiceImpl}.
  *
- * <h2>Test strategy</h2>
- * <p>The constructor is lightweight (no keystore I/O); all real work happens inside
- * {@code getAccessToken()} via the lazy {@code initPrivateTwtTokenService()} call.
- * To test the HTTP/JWT path without a real Keycloak we subclass
- * {@link PrivateJwtTokenServiceImpl} and override {@code buildRestClient} to return
- * a fully-mocked {@link RestClient} chain — the same approach already used in the
- * existing {@code OAuth2TokenServiceImplTest}.</p>
- *
- * <p>A real PKCS12 keystore is generated per-test via {@link KeystoreFixture}
- * so that keystore-loading and kid-derivation logic runs against genuine certificate
- * bytes.</p>
+ * <p>The private key and leaf certificate are now read directly from Vault (no keystore file on
+ * disk — the Azure SMB file share has been removed). Tests stub {@link VaultSecretProvider} with
+ * genuine PEM material so key-loading and kid-derivation run against real certificate bytes.</p>
  */
 class PrivateJwtTokenServiceImplTest {
 
     private static final String TOKEN_URI = "https://keycloak.example.com/realms/test/protocol/openid-connect/token";
     private static final String CLIENT_ID = "cert-manager-client";
-    private static final String ALIAS = "federator";
-
-    @TempDir
-    Path tempDir;
 
     private MtlsHttpClientBuilder mockHttpClientBuilder;
     private VaultSecretProvider mockVaultSecretProvider;
-    private CertificateProperties mockCertificateProperties;
-    private CertificateProperties.Destination mockDestination;
-    private KeystoreFixture fixture;
+
+    private String leafPem;
+    private String privateKeyPem;
+    private String publicKeyPem;
+    private X509Certificate leafCert;
 
     @BeforeEach
     void setUp() throws Exception {
-        fixture = KeystoreFixture.create(tempDir, ALIAS);
+        KeyPairGenerator kpg = KeyPairGenerator.getInstance("RSA");
+        kpg.initialize(2048);
+        KeyPair caKeyPair = kpg.generateKeyPair();
+        KeyPair leafKeyPair = kpg.generateKeyPair();
+
+        X500Name caName = new X500Name("CN=CA");
+        X500Name leafName = new X500Name("CN=federator.dpn.local");
+        leafCert = createCert(leafName, caName, leafKeyPair.getPublic(), caKeyPair.getPrivate());
+
+        leafPem = PemUtil.toPem("CERTIFICATE", leafCert.getEncoded());
+        privateKeyPem = PemUtil.toPem("PRIVATE KEY", leafKeyPair.getPrivate().getEncoded());
+        publicKeyPem = PemUtil.toPem("PUBLIC KEY", leafKeyPair.getPublic().getEncoded());
 
         mockHttpClientBuilder = mock(MtlsHttpClientBuilder.class);
         mockVaultSecretProvider = mock(VaultSecretProvider.class);
-        mockCertificateProperties = mock(CertificateProperties.class);
-        mockDestination = mock(CertificateProperties.Destination.class);
-
-        // Stub buildHttpClient so the try-with-resources in getAccessToken() never NPEs.
-        // buildRestClient() is overridden in buildServiceWithMockRestClient() so the
-        // actual httpClient value doesn't matter for most tests.
         when(mockHttpClientBuilder.buildHttpClient()).thenReturn(mock(CloseableHttpClient.class));
-
-        when(mockCertificateProperties.getDestination()).thenReturn(mockDestination);
-        when(mockDestination.getPath()).thenReturn(tempDir.toString());
-        when(mockDestination.getKeystoreFile()).thenReturn(fixture.keystoreFileName());
-        when(mockDestination.getKeystoreAlias()).thenReturn(ALIAS);
-        when(mockDestination.getKeystorePassword()).thenReturn(fixture.password());
     }
 
-    // -----------------------------------------------------------------------
-    // Convenience factory
-    // -----------------------------------------------------------------------
+    private void stubVaultWithMaterial() {
+        when(mockVaultSecretProvider.getCertificate()).thenReturn(leafPem);
+        when(mockVaultSecretProvider.getKeyPair())
+                .thenReturn(CreateKeyResponseDTO.builder()
+                        .privateKeyPem(privateKeyPem)
+                        .publicKeyPem(publicKeyPem)
+                        .build());
+    }
 
     private PrivateJwtTokenServiceImpl buildServiceWithAlgo(String algorithm) {
         return new PrivateJwtTokenServiceImpl(
-                mockHttpClientBuilder,
-                TOKEN_URI,
-                CLIENT_ID,
-                algorithm,
-                mockCertificateProperties,
-                mockVaultSecretProvider);
+                mockHttpClientBuilder, TOKEN_URI, CLIENT_ID, algorithm, mockVaultSecretProvider);
     }
 
-    private PrivateJwtTokenServiceImpl buildService() {
-        return buildServiceWithAlgo("RS256");
-    }
-
-    /**
-     * Subclass that injects a mock {@link RestClient} so {@code getAccessToken()}
-     * never opens a real HTTP connection. The mock is fully wired via the fluent
-     * RestClient builder chain.
-     */
     private PrivateJwtTokenServiceImpl buildServiceWithMockRestClient(RestClient mockRestClient) {
         return new PrivateJwtTokenServiceImpl(
-                mockHttpClientBuilder,
-                TOKEN_URI,
-                CLIENT_ID,
-                "RS256",
-                mockCertificateProperties,
-                mockVaultSecretProvider) {
+                mockHttpClientBuilder, TOKEN_URI, CLIENT_ID, "RS256", mockVaultSecretProvider) {
             @Override
             protected RestClient buildRestClient(CloseableHttpClient httpClient) {
                 return mockRestClient;
@@ -113,12 +102,12 @@ class PrivateJwtTokenServiceImplTest {
     }
 
     // -----------------------------------------------------------------------
-    // Constructor — lightweight, no keystore I/O at construction time
+    // Constructor
     // -----------------------------------------------------------------------
 
     @Test
     void constructor_succeedsWithValidConfig() {
-        assertDoesNotThrow(this::buildService);
+        assertDoesNotThrow(() -> buildServiceWithAlgo("RS256"));
     }
 
     @Test
@@ -127,201 +116,78 @@ class PrivateJwtTokenServiceImplTest {
         assertTrue(ex.getMessage().contains("Unsupported JWT signing algorithm"));
     }
 
-    @Test
-    void constructor_defaultsToRs256_whenAlgorithmNotSpecified() {
-        // Default value is injected via @Value default; simulate by passing "RS256" explicitly.
-        assertDoesNotThrow(() -> buildServiceWithAlgo("RS256"));
-    }
-
     // -----------------------------------------------------------------------
-    // getAccessToken — keystore/password resolution (via initPrivateTwtTokenService)
+    // Vault material loading
     // -----------------------------------------------------------------------
 
     @Test
-    void getAccessToken_throws_whenBasePathIsNotADirectory() {
-        when(mockDestination.getPath()).thenReturn(tempDir.resolve("nonexistent-dir").toString());
+    void getAccessToken_throws_whenCertificateMissingInVault() {
+        when(mockVaultSecretProvider.getCertificate()).thenReturn(null);
 
         PrivateJwtTokenServiceImpl service = buildServiceWithMockRestClient(mock(RestClient.class));
 
         OAuth2TokenException ex = assertThrows(OAuth2TokenException.class, service::getAccessToken);
-        assertTrue(ex.getMessage().contains("Keystore base path is not a valid path"));
-    }
-
-    @Test
-    void getAccessToken_throws_whenKeystoreFileNameIsBlank() {
-        when(mockDestination.getKeystoreFile()).thenReturn("  ");
-
-        PrivateJwtTokenServiceImpl service = buildServiceWithMockRestClient(mock(RestClient.class));
-
-        OAuth2TokenException ex = assertThrows(OAuth2TokenException.class, service::getAccessToken);
-        assertTrue(ex.getMessage().contains("Keystore file name is not a valid"));
-    }
-
-    @Test
-    void getAccessToken_throws_whenKeystoreAliasNotFoundInKeystore() {
-        when(mockDestination.getKeystoreAlias()).thenReturn("no-such-alias");
-
-        PrivateJwtTokenServiceImpl service = buildServiceWithMockRestClient(mock(RestClient.class));
-
-        OAuth2TokenException ex = assertThrows(OAuth2TokenException.class, service::getAccessToken);
-        assertTrue(ex.getMessage().contains("Failed to load keystore")
-                || ex.getMessage().contains("No private key for alias"));
-    }
-
-    @Test
-    void getAccessToken_throws_whenKeystorePasswordWrong() {
-        when(mockDestination.getKeystorePassword()).thenReturn("wrong-password");
-
-        PrivateJwtTokenServiceImpl service = buildServiceWithMockRestClient(mock(RestClient.class));
-
-        OAuth2TokenException ex = assertThrows(OAuth2TokenException.class, service::getAccessToken);
-        assertTrue(ex.getMessage().contains("Failed to load keystore")
+        assertTrue(ex.getMessage().contains("No certificate found in Vault")
                 || ex.getMessage().contains("Error retrieving OAuth2 token"));
     }
 
-//    @Test
-//    void getAccessToken_resolvesPasswordFromVault_whenConfiguredPasswordIsBlank() {
-//        when(mockDestination.getKeystorePassword()).thenReturn(null);
-//        when(mockVaultSecretProvider.getSecret("keystore-password"))
-//                .thenReturn(Map.of("password", fixture.password()));
-//
-//        PrivateJwtTokenServiceImpl service = buildServiceWithMockRestClient(buildSuccessRestClient("vault-token", 300));
-//
-//        String token = service.getAccessToken().getAccessToken();
-//
-//        assertEquals("vault-token", token);
-//        verify(mockVaultSecretProvider).getSecret("keystore-password");
-//    }
-
     @Test
-    void getAccessToken_throws_whenPasswordAbsentFromBothConfigAndVault() {
-        when(mockDestination.getKeystorePassword()).thenReturn(null);
-        when(mockVaultSecretProvider.getSecret("keystore-password")).thenReturn(Map.of());
+    void getAccessToken_throws_whenPrivateKeyMissingInVault() {
+        when(mockVaultSecretProvider.getCertificate()).thenReturn(leafPem);
+        when(mockVaultSecretProvider.getKeyPair())
+                .thenReturn(CreateKeyResponseDTO.builder().build());
 
         PrivateJwtTokenServiceImpl service = buildServiceWithMockRestClient(mock(RestClient.class));
 
         OAuth2TokenException ex = assertThrows(OAuth2TokenException.class, service::getAccessToken);
-        assertTrue(ex.getMessage().contains("Keystore password not configured and not found in vault"));
+        assertTrue(ex.getMessage().contains("No private key found in Vault")
+                || ex.getMessage().contains("Error retrieving OAuth2 token"));
     }
-
-    // -----------------------------------------------------------------------
-    // getAccessToken — successful token retrieval
-    // -----------------------------------------------------------------------
-
-//    @Test
-//    void getAccessToken_returnsTokenResponse_onSuccess() {
-//        PrivateJwtTokenServiceImpl service = buildServiceWithMockRestClient(
-//                buildSuccessRestClient("access-token-xyz", 300));
-//
-//        TokenResponse response = service.getAccessToken();
-//
-//        assertNotNull(response);
-//        assertEquals("access-token-xyz", response.getAccessToken());
-//        assertEquals(300, response.getExpiresIn());
-//    }
 
     @Test
-    void getAccessToken_reinitialisesKeystoreOnEveryCall() {
-        // initPrivateTwtTokenService() is called inside getAccessToken() on every invocation.
-        // Two successive calls must both succeed — no stale state should cause the second to fail.
-        // Use RETURNS_DEEP_STUBS so the fluent RestClient chain resolves on repeated calls.
-        RestClient reusableRestClient = mock(RestClient.class, RETURNS_DEEP_STUBS);
-        Map<String, Object> payload = Map.of("access_token", "token", "expires_in", 60L);
-        when(reusableRestClient
-                .post()
-                .uri(anyString())
-                .contentType(any(MediaType.class))
-                .body(any())
-                .retrieve()
-                .body(any(org.springframework.core.ParameterizedTypeReference.class)))
-                .thenReturn(payload);
+    void loadKeystoreContentsFromVault_succeeds() {
+        stubVaultWithMaterial();
+        PrivateJwtTokenServiceImpl service = buildServiceWithAlgo("RS256");
 
-        PrivateJwtTokenServiceImpl service = buildServiceWithMockRestClient(reusableRestClient);
+        PrivateJwtTokenServiceImpl.KeystoreContents contents = service.loadKeystoreContentsFromVault();
 
-//        assertDoesNotThrow(service::getAccessToken);
-//        assertDoesNotThrow(service::getAccessToken);
+        assertNotNull(contents.privateKey());
+        assertNotNull(contents.kid());
+        assertFalse(contents.kid().isBlank());
     }
 
     // -----------------------------------------------------------------------
-    // JWT assertion content
+    // getAccessToken — response handling
     // -----------------------------------------------------------------------
 
-//    @Test
-//    void getAccessToken_sendsValidSignedJwtAssertion_withExpectedClaims() throws Exception {
-//        java.util.concurrent.atomic.AtomicReference<Map<?, ?>> capturedFormData =
-//                new java.util.concurrent.atomic.AtomicReference<>();
-//
-//        RestClient mockRestClient = buildCapturingRestClient(capturedFormData, "tok", 60);
-//
-//        PrivateJwtTokenServiceImpl service = buildServiceWithMockRestClient(mockRestClient);
-//        service.getAccessToken();
-//
-//        Map<?, ?> form = capturedFormData.get();
-//        assertNotNull(form);
-//
-//        String assertionType = extractFirst(form, "client_assertion_type");
-//        assertEquals("urn:ietf:params:oauth:client-assertion-type:jwt-bearer", assertionType);
-//
-//        String grantType = extractFirst(form, "grant_type");
-//        assertEquals("client_credentials", grantType);
-//
-//        String clientId = extractFirst(form, "client_id");
-//        assertEquals(CLIENT_ID, clientId);
-//
-//        String rawAssertion = extractFirst(form, "client_assertion");
-//        assertNotNull(rawAssertion);
-//
-//        SignedJWT jwt = SignedJWT.parse(rawAssertion);
-//        assertEquals(CLIENT_ID, jwt.getJWTClaimsSet().getIssuer());
-//        assertEquals(CLIENT_ID, jwt.getJWTClaimsSet().getSubject());
-//        assertEquals(java.util.List.of(TOKEN_URI), jwt.getJWTClaimsSet().getAudience());
-//        assertNotNull(jwt.getJWTClaimsSet().getJWTID());
-//        assertEquals("JWT", jwt.getHeader().getType().toString());
-//        assertNotNull(jwt.getHeader().getKeyID());
-//    }
+    @Test
+    void getAccessToken_returnsToken_onSuccess() {
+        stubVaultWithMaterial();
+        RestClient mockRestClient = buildSuccessRestClientWithBody(Map.of("access_token", "tok-123", "expires_in", 300));
 
-//    @Test
-//    void getAccessToken_assertionKeyId_matchesCertificateThumbprint() throws Exception {
-//        java.util.concurrent.atomic.AtomicReference<Map<?, ?>> capturedFormData =
-//                new java.util.concurrent.atomic.AtomicReference<>();
-//
-//        PrivateJwtTokenServiceImpl service = buildServiceWithMockRestClient(
-//                buildCapturingRestClient(capturedFormData, "tok", 60));
-//        service.getAccessToken();
-//
-//        String rawAssertion = extractFirst(capturedFormData.get(), "client_assertion");
-//        SignedJWT jwt = SignedJWT.parse(rawAssertion);
-//        String kidInJwt = jwt.getHeader().getKeyID();
-//
-//        X509Certificate cert = loadLeafCert(fixture);
-//        String expectedKid = Base64.getUrlEncoder()
-//                .withoutPadding()
-//                .encodeToString(MessageDigest.getInstance("SHA-256").digest(cert.getEncoded()));
-//
-//        assertEquals(expectedKid, kidInJwt);
-//    }
+        PrivateJwtTokenServiceImpl service = buildServiceWithMockRestClient(mockRestClient);
 
-    // -----------------------------------------------------------------------
-    // getAccessToken — failure paths from Keycloak response
-    // -----------------------------------------------------------------------
+        TokenResponse response = service.getAccessToken();
+        assertNotNull(response);
+        assertEquals("tok-123", response.getAccessToken());
+        assertEquals(300, response.getExpiresIn());
+    }
 
     @Test
     void getAccessToken_throws_whenResponseMissingAccessToken() {
+        stubVaultWithMaterial();
         RestClient mockRestClient = buildSuccessRestClientWithBody(Map.of("token_type", "Bearer"));
 
         PrivateJwtTokenServiceImpl service = buildServiceWithMockRestClient(mockRestClient);
 
-        // The inner OAuth2TokenException("Missing access_token...") is caught by the outer
-        // catch(OAuth2TokenException e) { throw e; } branch and re-thrown directly.
         OAuth2TokenException ex = assertThrows(OAuth2TokenException.class, service::getAccessToken);
-        assertTrue(
-                ex.getMessage().contains("Missing access_token in response")
-                        || ex.getMessage().contains("Error retrieving OAuth2 token via private_key_jwt"),
-                "Expected missing-token or outer-wrapper message, got: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("Missing access_token in response")
+                || ex.getMessage().contains("Error retrieving OAuth2 token via private_key_jwt"));
     }
 
     @Test
     void getAccessToken_throws_whenRestClientThrows() {
+        stubVaultWithMaterial();
         RestClient mockRestClient = buildThrowingRestClient(
                 new org.springframework.web.client.RestClientException("connection refused"));
 
@@ -331,122 +197,29 @@ class PrivateJwtTokenServiceImplTest {
         assertTrue(ex.getMessage().contains("Error retrieving OAuth2 token via private_key_jwt"));
     }
 
-    @Test
-    void getAccessToken_throws_whenResponseIsNull() {
-        RestClient mockRestClient = buildSuccessRestClientWithBody(null);
-
-        PrivateJwtTokenServiceImpl service = buildServiceWithMockRestClient(mockRestClient);
-
-        // Null response: inner OAuth2TokenException("Missing access_token...") is re-thrown
-        // directly by the catch(OAuth2TokenException e) guard.
-        OAuth2TokenException ex = assertThrows(OAuth2TokenException.class, service::getAccessToken);
-        assertTrue(
-                ex.getMessage().contains("Missing access_token in response")
-                        || ex.getMessage().contains("Error retrieving OAuth2 token via private_key_jwt"),
-                "Expected missing-token or outer-wrapper message, got: " + ex.getMessage());
-    }
-
     // -----------------------------------------------------------------------
-    // Static helpers — loadKeystoreContents
-    // -----------------------------------------------------------------------
-
-    @Test
-    void loadKeystoreContents_succeeds_withValidKeystore() {
-        PrivateJwtTokenServiceImpl.KeystoreContents contents = PrivateJwtTokenServiceImpl.loadKeystoreContents(
-                fixture.keystorePath().toString(), fixture.password(), fixture.alias());
-
-        assertNotNull(contents.privateKey());
-        assertNotNull(contents.kid());
-        assertFalse(contents.kid().isBlank());
-    }
-
-    @Test
-    void loadKeystoreContents_throws_whenPathBlank() {
-        OAuth2TokenException ex = assertThrows(OAuth2TokenException.class,
-                () -> PrivateJwtTokenServiceImpl.loadKeystoreContents("  ", fixture.password(), fixture.alias()));
-        assertTrue(ex.getMessage().contains("private_key_jwt requires"));
-    }
-
-    @Test
-    void loadKeystoreContents_throws_whenPasswordBlank() {
-        OAuth2TokenException ex = assertThrows(OAuth2TokenException.class,
-                () -> PrivateJwtTokenServiceImpl.loadKeystoreContents(fixture.keystorePath().toString(), "", fixture.alias()));
-        assertTrue(ex.getMessage().contains("private_key_jwt requires"));
-    }
-
-    @Test
-    void loadKeystoreContents_throws_whenAliasBlank() {
-        OAuth2TokenException ex = assertThrows(OAuth2TokenException.class,
-                () -> PrivateJwtTokenServiceImpl.loadKeystoreContents(fixture.keystorePath().toString(), fixture.password(), ""));
-        assertTrue(ex.getMessage().contains("private_key_jwt requires"));
-    }
-
-    @Test
-    void loadKeystoreContents_throws_whenAliasNotInKeystore() {
-        OAuth2TokenException ex = assertThrows(OAuth2TokenException.class,
-                () -> PrivateJwtTokenServiceImpl.loadKeystoreContents(
-                        fixture.keystorePath().toString(), fixture.password(), "no-such-alias"));
-        assertTrue(ex.getMessage().contains("No private key for alias")
-                || ex.getMessage().contains("Failed to load keystore"));
-    }
-
-    @Test
-    void loadKeystoreContents_throws_whenFileDoesNotExist() {
-        OAuth2TokenException ex = assertThrows(OAuth2TokenException.class,
-                () -> PrivateJwtTokenServiceImpl.loadKeystoreContents(
-                        tempDir.resolve("ghost.p12").toString(), fixture.password(), fixture.alias()));
-        assertTrue(ex.getMessage().contains("Failed to load keystore"));
-    }
-
-    @Test
-    void loadKeystoreContents_throws_whenPasswordIncorrect() {
-        OAuth2TokenException ex = assertThrows(OAuth2TokenException.class,
-                () -> PrivateJwtTokenServiceImpl.loadKeystoreContents(
-                        fixture.keystorePath().toString(), "wrong-password", fixture.alias()));
-        assertTrue(ex.getMessage().contains("Failed to load keystore"));
-    }
-
-    // -----------------------------------------------------------------------
-    // Static helpers — deriveKidFromCertificate
+    // deriveKidFromCertificate
     // -----------------------------------------------------------------------
 
     @Test
     void deriveKidFromCertificate_matchesManualSha256Thumbprint() throws Exception {
-        X509Certificate cert = loadLeafCert(fixture);
-
         String expected = Base64.getUrlEncoder()
                 .withoutPadding()
-                .encodeToString(MessageDigest.getInstance("SHA-256").digest(cert.getEncoded()));
+                .encodeToString(MessageDigest.getInstance("SHA-256").digest(leafCert.getEncoded()));
 
-        assertEquals(expected, PrivateJwtTokenServiceImpl.deriveKidFromCertificate(cert));
+        assertEquals(expected, PrivateJwtTokenServiceImpl.deriveKidFromCertificate(leafCert));
     }
 
     @Test
-    void deriveKidFromCertificate_isDeterministic() throws Exception {
-        X509Certificate cert = loadLeafCert(fixture);
+    void deriveKidFromCertificate_isDeterministic() {
         assertEquals(
-                PrivateJwtTokenServiceImpl.deriveKidFromCertificate(cert),
-                PrivateJwtTokenServiceImpl.deriveKidFromCertificate(cert));
-    }
-
-    @Test
-    void deriveKidFromCertificate_differsForDifferentCertificates() throws Exception {
-        KeystoreFixture other = KeystoreFixture.create(tempDir, "other-alias");
-        X509Certificate cert1 = loadLeafCert(fixture);
-        X509Certificate cert2 = loadLeafCert(other);
-        assertNotEquals(
-                PrivateJwtTokenServiceImpl.deriveKidFromCertificate(cert1),
-                PrivateJwtTokenServiceImpl.deriveKidFromCertificate(cert2));
+                PrivateJwtTokenServiceImpl.deriveKidFromCertificate(leafCert),
+                PrivateJwtTokenServiceImpl.deriveKidFromCertificate(leafCert));
     }
 
     // -----------------------------------------------------------------------
-    // Mock RestClient builder helpers
+    // Mock RestClient helpers
     // -----------------------------------------------------------------------
-
-    @SuppressWarnings("unchecked")
-    private RestClient buildSuccessRestClient(String accessToken, long expiresIn) {
-        return buildSuccessRestClientWithBody(Map.of("access_token", accessToken, "expires_in", expiresIn));
-    }
 
     @SuppressWarnings("unchecked")
     private RestClient buildSuccessRestClientWithBody(Object body) {
@@ -458,9 +231,10 @@ class PrivateJwtTokenServiceImplTest {
         when(mockRestClient.post()).thenReturn(uriSpec);
         when(uriSpec.uri(anyString())).thenReturn(bodySpec);
         when(bodySpec.contentType(any(MediaType.class))).thenReturn(bodySpec);
-        when(bodySpec.body(any())).thenReturn(bodySpec);
+        when(bodySpec.body(any(org.springframework.util.MultiValueMap.class))).thenReturn(bodySpec);
         when(bodySpec.retrieve()).thenReturn(responseSpec);
-        when(responseSpec.body(any(org.springframework.core.ParameterizedTypeReference.class))).thenReturn(body);
+        when(responseSpec.body(any(org.springframework.core.ParameterizedTypeReference.class)))
+                .thenReturn(body);
 
         return mockRestClient;
     }
@@ -477,62 +251,20 @@ class PrivateJwtTokenServiceImplTest {
         when(bodySpec.contentType(any(MediaType.class))).thenReturn(bodySpec);
         when(bodySpec.body(any())).thenReturn(bodySpec);
         when(bodySpec.retrieve()).thenReturn(responseSpec);
-        when(responseSpec.body(any(org.springframework.core.ParameterizedTypeReference.class))).thenThrow(exception);
-
-        return mockRestClient;
-    }
-
-    /**
-     * Builds a RestClient mock that captures the form body passed to {@code .body()} so
-     * tests can inspect the JWT assertion and other form fields.
-     */
-    @SuppressWarnings("unchecked")
-    private RestClient buildCapturingRestClient(
-            java.util.concurrent.atomic.AtomicReference<Map<?, ?>> capture,
-            String accessToken,
-            long expiresIn) {
-
-        RestClient mockRestClient = mock(RestClient.class);
-        RestClient.RequestBodyUriSpec uriSpec = mock(RestClient.RequestBodyUriSpec.class);
-        RestClient.RequestBodySpec bodySpec = mock(RestClient.RequestBodySpec.class);
-        RestClient.ResponseSpec responseSpec = mock(RestClient.ResponseSpec.class);
-
-        when(mockRestClient.post()).thenReturn(uriSpec);
-        when(uriSpec.uri(anyString())).thenReturn(bodySpec);
-        when(bodySpec.contentType(any(MediaType.class))).thenReturn(bodySpec);
-        when(bodySpec.body(any())).thenAnswer(invocation -> {
-            capture.set((Map<?, ?>) invocation.getArgument(0));
-            return bodySpec;
-        });
-        when(bodySpec.retrieve()).thenReturn(responseSpec);
         when(responseSpec.body(any(org.springframework.core.ParameterizedTypeReference.class)))
-                .thenReturn(Map.of("access_token", accessToken, "expires_in", expiresIn));
+                .thenThrow(exception);
 
         return mockRestClient;
     }
 
-    // -----------------------------------------------------------------------
-    // Test utilities
-    // -----------------------------------------------------------------------
-
-    private static X509Certificate loadLeafCert(KeystoreFixture f) throws Exception {
-        KeyStore ks = KeyStore.getInstance("PKCS12");
-        try (var fis = new java.io.FileInputStream(f.keystorePath().toFile())) {
-            ks.load(fis, f.password().toCharArray());
-        }
-        return (X509Certificate) ks.getCertificateChain(f.alias())[0];
-    }
-
-    /**
-     * Extracts the first value from a {@link org.springframework.util.MultiValueMap}-shaped
-     * map (key → List<String>) as captured from the RestClient {@code .body()} argument.
-     */
-    @SuppressWarnings("unchecked")
-    private static String extractFirst(Map<?, ?> formData, String key) {
-        Object value = formData.get(key);
-        if (value instanceof java.util.List<?> list) {
-            return list.isEmpty() ? null : (String) list.get(0);
-        }
-        return value != null ? value.toString() : null;
+    private X509Certificate createCert(X500Name subject, X500Name issuer, PublicKey pubKey, PrivateKey privKey)
+            throws Exception {
+        long now = System.currentTimeMillis();
+        Date start = new Date(now);
+        Date end = new Date(now + 1000000);
+        ContentSigner signer = new JcaContentSignerBuilder("SHA256withRSA").build(privKey);
+        X509v3CertificateBuilder certBuilder =
+                new JcaX509v3CertificateBuilder(issuer, BigInteger.valueOf(now), start, end, subject, pubKey);
+        return new JcaX509CertificateConverter().getCertificate(certBuilder.build(signer));
     }
 }

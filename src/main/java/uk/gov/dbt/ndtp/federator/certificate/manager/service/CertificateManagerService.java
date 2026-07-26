@@ -16,9 +16,4 @@ public interface CertificateManagerService {
      * Also ensures the intermediate CA is refreshed.
      */
     void run();
-
-    /**
-     * Periodically executed task to synchronize on-disk keystores and truststores with Vault.
-     */
-    void sync();
 }
