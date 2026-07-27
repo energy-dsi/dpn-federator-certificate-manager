@@ -8,11 +8,19 @@ spring:
       uri: ${VAULT_URI:http://localhost:8200}
       token: ${VAULT_TOKEN:}
       authentication: ${VAULT_AUTHENTICATION:token}
+      app-role:
+        role-id: ${VAULT_APPROLE_ROLE_ID:}
+        secret-id: ${VAULT_APPROLE_SECRET_ID:}
+        role: ${VAULT_APPROLE_ROLE:certificate-manager}
+        app-role-path: ${VAULT_APPROLE_MOUNT_PATH:approle}
       kubernetes:
         role: ${VAULT_AUTH_ROLE:certificate-manager}
+      # TLS to Vault. Leave VAULT_SSL_TRUST_STORE empty when Vault is reached over http
+      # (e.g. local dev / in-cluster plaintext); set it (e.g. classpath:truststore.jks or a
+      # mounted file path) when Vault is served over https with a private CA.
       ssl:
-        trust-store: classpath:truststore.jks
-        trust-store-password: changeit
+        trust-store: ${VAULT_SSL_TRUST_STORE:}
+        trust-store-password: ${VAULT_SSL_TRUST_STORE_PASSWORD:}
 
 
 application:
