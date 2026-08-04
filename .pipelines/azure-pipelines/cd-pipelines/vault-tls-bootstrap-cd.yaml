@@ -1,0 +1,257 @@
+trigger: none
+
+# =============================================================================
+# Vault TLS + Truststore Bootstrap — DPN Platform   (PART 1 of 2)
+#
+# Self-contained initial bring-up of the Vault HTTPS server TLS material and the
+# certificate-manager truststore. In ONE run it:
+#   - generates a self-signed Root CA  (CN=dpn-vault-root)
+#   - generates the Vault leaf key + CSR + cert (CN=vault, fixed SANs)
+#   - builds the PKCS12 truststore.jks (Root CA as trust anchor)
+#   - publishes to Azure Key Vault (selected from the env config JSON):
+#       VAULT-TLS-CERT            <- vault.crt
+#       VAULT-TLS-KEY             <- vault.key
+#       VAULT-TRUSTSTORE-PASSWORD <- user-provided password
+#   - publishes truststore.jks to the 'cert-manager-truststore' K8s secret
+#
+# Customer inputs: Country (C) and Organisation (O).
+# SAN is fixed to vault-https.ns-dpn-01.svc.cluster.local in create-vault-tls-bootstrap.sh.
+#
+# Config resolved from:
+#   .pipelines/azure-pipelines/config/<env>-<cluster>.json
+#
+# PART 2 (load the DSM-signed client bundle into Vault) is the separate
+# 'vault-load-bundle-cd.yaml' pipeline.
+# Deploy / init Vault itself with 'vault-https-cd.yaml'.
+# =============================================================================
+
+parameters:
+
+  - name: ServiceConnection
+    displayName: 'ServiceConnection details'
+    type: string
+    default: 'sc-dpn-dev-001'
+    values:
+      - sc-dpn-dev-001
+      - sc-dpn-dev-002
+      - sc-dpn-test-001
+      - sc-dpn-test-002
+      - sc-dpn-pdev-ppd-001
+      - sc-dpn-ptest-ppd-001
+      - sc-dpn-puat-ppd-001
+
+  - name: environment
+    displayName: Environment Name
+    type: string
+    default: 'dev'
+    values:
+      - dev
+      - devtest
+      - test
+      - pdev
+      - ptest
+      - puat
+
+  - name: dpnCluster
+    displayName: "Target DPN Cluster (pdev/ptest/puat have only one DPN — dpn02 is disabled for those environments)"
+    type: string
+    default: "dpn01"
+    values:
+      - dpn01
+      - dpn02
+
+  - name: country
+    displayName: "Country (C)"
+    type: string
+    default: "GB"
+
+  - name: org
+    displayName: "Organisation (O)"
+    type: string
+    default: "DSI"
+
+  - name: truststorePassword
+    displayName: "Truststore password (written to Key Vault as VAULT-TRUSTSTORE-PASSWORD)"
+    type: string
+    default: "changeit"
+
+variables:
+  - name: PARAMETERS_FILE
+    value: ".pipelines/azure-pipelines/config/${{ parameters.environment }}-${{ parameters.dpnCluster }}.json"
+
+  - ${{ if or(eq(parameters.environment, 'pdev'), eq(parameters.environment, 'ptest'), eq(parameters.environment, 'puat')) }}:
+    - name: APPROVAL_GROUP
+      value: dsi-ppd
+  - ${{ elseif or(eq(parameters.environment, 'devtest'), eq(parameters.environment, 'test')) }}:
+    - name: APPROVAL_GROUP
+      value: dsi-devtest
+  - ${{ else }}:
+    - name: APPROVAL_GROUP
+      value: dsi-dev
+
+stages:
+
+# ============================================================
+# Guard — pdev/ptest/puat only have one DPN; dpn02 is disabled
+# ============================================================
+- stage: GuardSingleDpn
+  displayName: "Guard — Single DPN Environments"
+  # This guard runs on EVERY run and FAILS only for the invalid combo. Do NOT
+  # re-add a stage-level `condition:` here — a skipped guard makes the downstream
+  # `condition: succeeded()` stages skip too (a skip is NOT a success), which
+  # silently skips the whole pipeline (the pdev+dpn01 no-op runs).
+  jobs:
+  - job: Block
+    pool:
+      name: "<<YOUR AGENT POOL>>"
+    steps:
+    - script: |
+        ENV="${{ parameters.environment }}"
+        CLUSTER="${{ parameters.dpnCluster }}"
+        if printf '%s' "$ENV" | grep -qE '^(pdev|ptest|puat)$' && [ "$CLUSTER" = "dpn02" ]; then
+          echo "##[error]dpn02 is disabled for environment '$ENV' — it has only a single DPN."
+          exit 1
+        fi
+        echo "Guard passed: environment '$ENV' with cluster '$CLUSTER' is a valid combination."
+      displayName: "Validate DPN cluster for environment"
+
+# ============================================================
+# Approval Gate (gated on the environment's approver group)
+# ============================================================
+- stage: Approval
+  displayName: "Approval Gate"
+
+  jobs:
+  - deployment: ApprovalJob
+    displayName: "Approve Vault TLS Bootstrap"
+    environment: "$(APPROVAL_GROUP)"
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - script: |
+              echo "=========================================="
+              echo " APPROVAL REQUIRED BEFORE VAULT TLS BOOTSTRAP"
+              echo "=========================================="
+              echo "Environment : ${{ parameters.environment }}"
+              echo "Cluster     : ${{ parameters.dpnCluster }}"
+              echo "=========================================="
+
+# ============================================================
+# Bootstrap Vault TLS
+# Generates Root CA + Vault leaf + truststore, then publishes:
+#   VAULT-TLS-CERT / VAULT-TLS-KEY / VAULT-TRUSTSTORE-PASSWORD -> Key Vault
+#   truststore.jks -> cert-manager-truststore K8s secret
+# ============================================================
+- stage: BootstrapVaultTls
+  displayName: "Bootstrap Vault TLS [${{ parameters.environment }}-${{ parameters.dpnCluster }}]"
+  dependsOn:
+  - GuardSingleDpn
+  - Approval
+  condition: succeeded()
+
+  jobs:
+  - deployment: BootstrapVaultTls
+    displayName: "Generate Vault TLS + truststore, publish to Key Vault"
+    environment: "vault-tls-bootstrap-${{ parameters.environment }}"
+    pool:
+      name: "<<YOUR AGENT POOL>>"
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - script: |
+              echo "Loading config from: $(PARAMETERS_FILE)"
+              for param in $(jq -r 'keys_unsorted | .[]' "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)"); do
+                value=$(jq -r ".\"$param\"" "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)")
+                echo "##vso[task.setvariable variable=$param]$value"
+              done
+            displayName: "Load Environment Config"
+
+          - task: AzureCLI@2
+            displayName: "Bootstrap Vault TLS + publish to Key Vault"
+            inputs:
+              azureSubscription: "${{ parameters.ServiceConnection }}"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                echo "=========================================="
+                echo " TRUSTSTORE PASSWORD (user-provided)"
+                echo "=========================================="
+                # Mask the user-provided password in all subsequent logs
+                TRUSTSTORE_PASS="${{ parameters.truststorePassword }}"
+                echo "##vso[task.setvariable variable=TRUSTSTORE_PASS;issecret=true]$TRUSTSTORE_PASS"
+
+                OUT_DIR="$(Build.ArtifactStagingDirectory)/vault-tls"
+
+                echo "=========================================="
+                echo " GENERATE ROOT CA + VAULT LEAF + TRUSTSTORE"
+                echo "=========================================="
+                COUNTRY="${{ parameters.country }}" \
+                ORG="${{ parameters.org }}" \
+                TRUSTSTORE_PASS="$TRUSTSTORE_PASS" \
+                OUT_DIR="$OUT_DIR" \
+                sh .pipelines/scripts/create-vault-tls-bootstrap.sh
+
+                echo "=========================================="
+                echo " PUBLISH TO KEY VAULT $(KEY_VAULT_NAME)"
+                echo "=========================================="
+                # Constant time portion; expiry = +355 days from today
+                EXPIRY="$(date -u -d '+355 days' '+%Y-%m-%d')T00:00:00Z"
+                echo "Secret expiry: $EXPIRY"
+
+                az keyvault secret set \
+                  --vault-name $(KEY_VAULT_NAME) \
+                  --name VAULT-TLS-CERT \
+                  --file "$OUT_DIR/certs/vault.crt" \
+                  --expires "$EXPIRY" \
+                  --output none
+
+                az keyvault secret set \
+                  --vault-name $(KEY_VAULT_NAME) \
+                  --name VAULT-TLS-KEY \
+                  --file "$OUT_DIR/certs/vault.key" \
+                  --expires "$EXPIRY" \
+                  --output none
+
+                az keyvault secret set \
+                  --vault-name $(KEY_VAULT_NAME) \
+                  --name VAULT-TRUSTSTORE-PASSWORD \
+                  --value "$TRUSTSTORE_PASS" \
+                  --expires "$EXPIRY" \
+                  --output none
+
+                echo "Wrote VAULT-TLS-CERT, VAULT-TLS-KEY, VAULT-TRUSTSTORE-PASSWORD to $(KEY_VAULT_NAME)."
+
+                echo "=========================================="
+                echo " AKS AUTH"
+                echo "=========================================="
+                which kubelogin >/dev/null 2>&1 || az aks install-cli
+                az account set --subscription $(AZURE_SUBSCRIPTION_ID)
+                az aks get-credentials \
+                  --resource-group $(RESOURCE_GROUP) \
+                  --name $(AKS_CLUSTER) \
+                  --overwrite-existing
+                kubelogin convert-kubeconfig -l azurecli
+
+                echo "=========================================="
+                echo " PUBLISH K8s SECRET cert-manager-truststore"
+                echo "=========================================="
+                kubectl create secret generic cert-manager-truststore \
+                  --namespace $(NAMESPACE) \
+                  --from-file=truststore.jks="$OUT_DIR/truststore.jks" \
+                  --dry-run=client -o yaml | kubectl apply -f -
+                echo "Secret 'cert-manager-truststore' created/updated in namespace $(NAMESPACE)."
+                echo "NOTE: restart certificate-manager to pick up the new truststore:"
+                echo "  kubectl rollout restart deployment/dpn-certificate-manager -n $(NAMESPACE)"
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish Vault TLS + truststore artifact"
+            inputs:
+              targetPath: "$(Build.ArtifactStagingDirectory)/vault-tls"
+              artifact: "vault-tls-${{ parameters.environment }}-${{ parameters.dpnCluster }}"

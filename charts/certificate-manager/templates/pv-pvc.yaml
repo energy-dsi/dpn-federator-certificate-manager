@@ -1,0 +1,59 @@
+{{- if .Values.fileShare.create }}
+# =============================================================================
+# Shared Azure File Share — PersistentVolume + PersistentVolumeClaim
+#
+# Auth: Storage Account Key via pre-existing K8s Secret
+#   kubectl create secret generic {{ .Values.fileShare.secretName }} \
+#     --namespace {{ .Values.fileShare.namespace }} \
+#     --from-literal=azurestorageaccountname=<account> \
+#     --from-literal=azurestorageaccountkey=<key>
+#
+# This single PVC is mounted by ALL three DPN components:
+#   - certificate-manager  (writes keystore.p12, truststore.p12)
+#   - federator-server     (reads /tls)
+#   - federator-client     (reads /tls)
+#
+# Set fileShare.create=false if the PV/PVC already exist in the cluster
+# to avoid duplicate resource errors across Helm releases.
+# =============================================================================
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: {{ .Values.fileShare.pvName }}
+  labels:
+    {{- include "certificate-manager.labels" . | nindent 4 }}
+spec:
+  capacity:
+    storage: {{ .Values.fileShare.size }}
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: {{ .Values.fileShare.storageClassName }}
+  csi:
+    driver: file.csi.azure.com
+    readOnly: false
+    volumeHandle: {{ .Values.fileShare.pvName }}
+    volumeAttributes:
+      storageAccount: {{ .Values.fileShare.storageAccount }}
+      shareName: {{ .Values.fileShare.shareName }}
+    nodeStageSecretRef:
+      name: {{ .Values.fileShare.secretName }}
+      namespace: {{ .Values.fileShare.namespace }}
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.fileShare.pvcName }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "certificate-manager.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: {{ .Values.fileShare.storageClassName }}
+  volumeName: {{ .Values.fileShare.pvName }}
+  resources:
+    requests:
+      storage: {{ .Values.fileShare.size }}
+{{- end }}

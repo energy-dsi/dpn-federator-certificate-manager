@@ -1,0 +1,9 @@
+{
+  "ENVIRONMENT": "ENVIRONMENT",
+  "AWS_ACCOUNT_ID": "AWS_ACCOUNT_ID",
+  "EKS_CLUSTER_NAME": "EKS_CLUSTER_NAME",
+  "NAMESPACE": "NAMESPACE",
+  "REGISTRY_URL": "registry.example.com",
+  "BASE_REGISTRY": "registry.example.com",
+  "SECRETS_PROVIDER": "aws-secrets-manager"
+}

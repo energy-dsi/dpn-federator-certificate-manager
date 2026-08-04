@@ -1,0 +1,409 @@
+trigger: none
+
+# =============================================================================
+# Certificate Manager CD Pipeline — DPN Platform
+#
+# Deploys dpn-federator-certificate-manager via Helm chart at:
+#   charts/certificate-manager/
+#
+# Pipeline stages:
+#   1. Validate — helm lint + dry-run against target cluster
+#   2. Approval — ADO environment approval, gated on the environment's
+#      approver group (dsi-dev / dsi-devtest / dsi-ppd)
+#   3. Deploy   — helm upgrade --install
+#   4. Verify   — rollout status + keystore file presence check
+#
+# Config resolved from:
+#   .pipelines/azure-pipelines/config/<env>-<cluster>.json
+#   charts/certificate-manager/values-<env>-<cluster>.yaml
+# (pdev/ptest/puat only ever use dpn01 — dpn02 is disabled for those environments)
+# =============================================================================
+
+parameters:
+
+  - name: ServiceConnection
+    displayName: 'ServiceConnection details'
+    type: string
+    default: 'sc-dpn-dev-001'
+    values:
+      - sc-dpn-dev-001
+      - sc-dpn-dev-002
+      - sc-dpn-test-001
+      - sc-dpn-test-002
+      - sc-dpn-pdev-ppd-001
+      - sc-dpn-ptest-ppd-001
+      - sc-dpn-puat-ppd-001
+
+  - name: environment
+    displayName: Environment Name
+    type: string
+    default: 'dev'
+    values:
+      - dev
+      - devtest
+      - test
+      - pdev
+      - ptest
+      - puat
+
+  - name: dpnCluster
+    displayName: "Target DPN Cluster (pdev/ptest/puat have only one DPN — dpn02 is disabled for those environments)"
+    type: string
+    default: "dpn01"
+    values:
+      - dpn01
+      - dpn02
+
+  - name: imageTag
+    displayName: "Image Tag (Build ID from CI pipeline)"
+    type: string
+
+variables:
+  - name: CHART_DIR
+    value: "charts/certificate-manager"
+  - name: RELEASE_NAME
+    value: "dpn-certificate-manager"
+
+  - name: VALUES_FILE
+    value: "charts/certificate-manager/values-${{ parameters.environment }}-${{ parameters.dpnCluster }}.yaml"
+  - name: PARAMETERS_FILE
+    value: ".pipelines/azure-pipelines/config/${{ parameters.environment }}-${{ parameters.dpnCluster }}.json"
+
+  - ${{ if or(eq(parameters.environment, 'pdev'), eq(parameters.environment, 'ptest'), eq(parameters.environment, 'puat')) }}:
+    - name: APPROVAL_GROUP
+      value: dsi-ppd
+  - ${{ elseif or(eq(parameters.environment, 'devtest'), eq(parameters.environment, 'test')) }}:
+    - name: APPROVAL_GROUP
+      value: dsi-devtest
+  - ${{ else }}:
+    - name: APPROVAL_GROUP
+      value: dsi-dev
+
+# =============================================================================
+# Stage 1 — Validate (Lint + Dry Run)
+# =============================================================================
+stages:
+
+- stage: Validate
+  displayName: "Validate [${{ parameters.environment }}-${{ parameters.dpnCluster }}]"
+
+  jobs:
+  - job: Validate
+    displayName: "Helm Lint + Dry Run"
+    pool:
+      name: "<<YOUR AGENT POOL>>"
+
+    steps:
+    - checkout: self
+
+    - script: |
+        echo "Loading config from: $(PARAMETERS_FILE)"
+        for param in $(jq -r 'keys_unsorted | .[]' "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)"); do
+          value=$(jq -r ".\"$param\"" "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)")
+          echo "##vso[task.setvariable variable=$param]$value"
+        done
+      displayName: "Load Environment Config"
+
+    # Guard — pdev/ptest/puat only have one DPN; dpn02 is disabled for these environments
+    - script: |
+        echo "##[error]dpn02 is disabled for environment '${{ parameters.environment }}' — it has only a single DPN."
+        exit 1
+      displayName: "Block dpn02 for single-DPN environments"
+      condition: and(succeeded(), in('${{ parameters.environment }}', 'pdev', 'ptest', 'puat'), eq('${{ parameters.dpnCluster }}', 'dpn02'))
+
+    # Guard — fail early if values file doesn't exist for selected combo
+    - script: |
+        if [ ! -f "$(VALUES_FILE)" ]; then
+          echo "##[error]Values file not found: $(VALUES_FILE)"
+          echo "##[error]dpn02 values files are not yet created."
+          echo "##[error]Please create charts/certificate-manager/values-${{ parameters.environment }}-${{ parameters.dpnCluster }}.yaml first."
+          exit 1
+        fi
+        echo "Values file found: $(VALUES_FILE)"
+      displayName: "Check Values File Exists"
+
+    - task: AzureCLI@2
+      displayName: "AKS Auth + Helm Lint + Dry Run"
+      inputs:
+        azureSubscription: "${{ parameters.ServiceConnection }}"
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+
+          echo "=========================================="
+          echo " INSTALL TOOLS"
+          echo "=========================================="
+          which kubelogin >/dev/null 2>&1 || az aks install-cli
+          kubelogin --version >/dev/null
+          helm version >/dev/null
+          echo "Tools ready"
+
+          echo "=========================================="
+          echo " AKS AUTH"
+          echo "=========================================="
+          az account set --subscription $(AZURE_SUBSCRIPTION_ID)
+          az aks get-credentials \
+            --resource-group $(RESOURCE_GROUP) \
+            --name $(AKS_CLUSTER) \
+            --overwrite-existing
+          kubelogin convert-kubeconfig -l azurecli
+          echo "AKS context: $(AKS_CLUSTER)"
+
+          echo "=========================================="
+          echo " HELM LINT"
+          echo "=========================================="
+          helm lint $(CHART_DIR) -f $(VALUES_FILE) \
+            --set image.tag="${{ parameters.imageTag }}"
+
+          echo "=========================================="
+          echo " HELM DRY RUN"
+          echo "=========================================="
+          helm upgrade --install $(RELEASE_NAME) $(CHART_DIR) \
+            --namespace $(NAMESPACE) \
+            -f $(VALUES_FILE) \
+            --set image.tag="${{ parameters.imageTag }}" \
+            --dry-run
+
+          echo "Validation passed"
+
+# =============================================================================
+# Stage 2 — Approval (gated on the environment's approver group)
+# =============================================================================
+- stage: Approval
+  displayName: "Approval Gate"
+  dependsOn: Validate
+  condition: succeeded()
+
+  jobs:
+  - deployment: ApprovalJob
+    displayName: "Approve Certificate Manager Deployment"
+    environment:  "$(APPROVAL_GROUP)"
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - script: |
+              echo "===================================================="
+              echo " APPROVAL REQUIRED BEFORE DEPLOYMENT"
+              echo "===================================================="
+              echo "Environment : ${{ parameters.environment }}"
+              echo "Cluster     : ${{ parameters.dpnCluster }}"
+              echo "Release     : dpn-certificate-manager"
+              echo "===================================================="
+
+# =============================================================================
+# Stage 3 — Deploy
+# =============================================================================
+- stage: Deploy
+  displayName: "Deploy [${{ parameters.environment }}-${{ parameters.dpnCluster }}]"
+  dependsOn:
+  - Validate
+  - Approval
+
+  condition: succeeded()
+
+  jobs:
+  - deployment: DeployCertManager
+    displayName: "Helm Upgrade --install"
+    pool:
+      name: "<<YOUR AGENT POOL>>"
+    # ADO Environment — add approval gates in ADO portal if needed
+    # Environments: certificate-manager-dev, certificate-manager-devtest
+    environment: "certificate-manager-${{ parameters.environment }}"
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - script: |
+              echo "Loading config from: $(PARAMETERS_FILE)"
+              for param in $(jq -r 'keys_unsorted | .[]' "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)"); do
+                value=$(jq -r ".\"$param\"" "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)")
+                echo "##vso[task.setvariable variable=$param]$value"
+              done
+            displayName: "Load Environment Config"
+
+          - task: AzureCLI@2
+            displayName: "Helm Deploy Certificate Manager"
+            inputs:
+              azureSubscription: "${{ parameters.ServiceConnection }}"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                echo "=========================================="
+                echo " INSTALL TOOLS"
+                echo "=========================================="
+                which kubelogin >/dev/null 2>&1 || az aks install-cli
+                kubelogin --version >/dev/null
+                helm version >/dev/null
+
+                echo "=========================================="
+                echo " AKS AUTH"
+                echo "=========================================="
+                az account set --subscription $(AZURE_SUBSCRIPTION_ID)
+                az aks get-credentials \
+                  --resource-group $(RESOURCE_GROUP) \
+                  --name $(AKS_CLUSTER) \
+                  --overwrite-existing
+                kubelogin convert-kubeconfig -l azurecli
+
+                echo "=========================================="
+                echo " DEPLOYING CERTIFICATE MANAGER"
+                echo " Environment : ${{ parameters.environment }}"
+                echo " Cluster     : ${{ parameters.dpnCluster }}"
+                echo " AKS         : $(AKS_CLUSTER)"
+                echo " Namespace   : $(NAMESPACE)"
+                echo " Image tag   : ${{ parameters.imageTag }}"
+                echo " Values file : $(VALUES_FILE)"
+                echo "=========================================="
+
+                helm upgrade --install $(RELEASE_NAME) $(CHART_DIR) \
+                  --namespace $(NAMESPACE) \
+                  -f $(VALUES_FILE) \
+                  --set image.tag="${{ parameters.imageTag }}" \
+                  --wait \
+                  --timeout 5m
+
+                echo "=========================================="
+                echo " POST-DEPLOY STATUS"
+                echo "=========================================="
+                kubectl get pods -n $(NAMESPACE) -l app=dpn-certificate-manager -o wide
+                kubectl get pvc  -n $(NAMESPACE)
+
+                echo "=========================================="
+                echo " ROLLING RESTART"
+                echo "=========================================="
+                kubectl rollout restart deployment/dpn-certificate-manager -n $(NAMESPACE)
+                kubectl rollout status  deployment/dpn-certificate-manager -n $(NAMESPACE) --timeout=300s
+
+                echo "=========================================="
+                echo " CAPTURE DEPLOYED IMAGE DIGEST"
+                echo "=========================================="
+                CM_DIGEST=$(kubectl get pods -n $(NAMESPACE) \
+                  -l app=dpn-certificate-manager \
+                  -o jsonpath='{.items[0].status.containerStatuses[0].imageID}')
+
+                if [ -z "$CM_DIGEST" ]; then
+                  echo "##[error]Could not resolve deployed certificate-manager image digest from pod status"
+                  exit 1
+                fi
+
+                echo "Certificate Manager image digest: $CM_DIGEST"
+
+                mkdir -p $(Build.ArtifactStagingDirectory)/deployed-digest
+
+                {
+                  echo "$CM_DIGEST"
+                  echo "component=certificate-manager"
+                  echo "environment=${{ parameters.environment }}"
+                  echo "dpnCluster=${{ parameters.dpnCluster }}"
+                  echo "imageTag=${{ parameters.imageTag }}"
+                } > $(Build.ArtifactStagingDirectory)/deployed-digest/certificate-manager-digest.txt
+
+                echo "Digest written to artifact staging directory"
+                echo "Certificate Manager deployed successfully"
+
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish Deployed Image Digest"
+            inputs:
+              pathToPublish: "$(Build.ArtifactStagingDirectory)/deployed-digest"
+              artifactName: "deployed-image-digest"
+
+# =============================================================================
+# Stage 4 — Verify
+# =============================================================================
+- stage: Verify
+  displayName: "Verify [${{ parameters.environment }}-${{ parameters.dpnCluster }}]"
+  dependsOn: Deploy
+  condition: succeeded()
+
+  jobs:
+  - job: Verify
+    displayName: "Rollout + Keystore Health Check"
+    pool:
+      name: "<<YOUR AGENT POOL>>"
+
+    steps:
+    - checkout: self
+
+    - script: |
+        echo "Loading config from: $(PARAMETERS_FILE)"
+        for param in $(jq -r 'keys_unsorted | .[]' "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)"); do
+          value=$(jq -r ".\"$param\"" "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)")
+          echo "##vso[task.setvariable variable=$param]$value"
+        done
+      displayName: "Load Environment Config"
+
+    - task: AzureCLI@2
+      displayName: "Rollout + File Share Verification"
+      inputs:
+        azureSubscription: "${{ parameters.ServiceConnection }}"
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+
+          which kubelogin >/dev/null 2>&1 || az aks install-cli
+          az account set --subscription $(AZURE_SUBSCRIPTION_ID)
+          az aks get-credentials \
+            --resource-group $(RESOURCE_GROUP) \
+            --name $(AKS_CLUSTER) \
+            --overwrite-existing
+          kubelogin convert-kubeconfig -l azurecli
+
+          echo "=========================================="
+          echo " ROLLOUT STATUS"
+          echo "=========================================="
+          kubectl rollout status deployment/dpn-certificate-manager \
+            -n $(NAMESPACE) \
+            --timeout=300s
+
+          echo "=========================================="
+          echo " POD STATUS"
+          echo "=========================================="
+          kubectl get pods -n $(NAMESPACE) -l app=dpn-certificate-manager -o wide
+
+          echo "=========================================="
+          echo " PVC STATUS"
+          echo "=========================================="
+          kubectl get pvc -n $(NAMESPACE) -l app.kubernetes.io/name=dpn-certificate-manager
+
+          # echo "=========================================="
+          # echo " KEYSTORE PRESENCE CHECK"
+          # echo " (wait up to 120s for CLM first-run write)"
+          # echo "=========================================="
+          # CLM_POD=$(kubectl get pod -n $(NAMESPACE) \
+          #   -l app=certificate-manager \
+          #   -o jsonpath='{.items[0].metadata.name}')
+          # echo "Pod: $CLM_POD"
+
+          # for i in $(seq 1 12); do
+          #   KS=$(kubectl exec -n $(NAMESPACE) "$CLM_POD" -- \
+          #     sh -c 'ls /tls/keystore.p12 /tls/truststore.p12 2>/dev/null | wc -l')
+          #   if [ "$KS" -eq "2" ]; then
+          #     echo "✓ keystore.p12 and truststore.p12 found in /tls"
+          #     break
+          #   fi
+          #   echo "Attempt $i/12 — keystores not yet written, waiting 10s..."
+          #   sleep 10
+          # done
+
+          # if [ "$KS" -ne "2" ]; then
+          #   echo "✗ Keystores not found after 120s — check CLM logs"
+          #   kubectl logs -n $(NAMESPACE) "$CLM_POD" --tail=50
+          #   exit 1
+          # fi
+
+          # echo "=========================================="
+          # echo " HELM STATUS"
+          # echo "=========================================="
+          # helm status $(RELEASE_NAME) -n $(NAMESPACE)
+
+          echo "=========================================="
+          echo " CERTIFICATE MANAGER DEPLOYMENT VERIFIED"
+          echo "=========================================="

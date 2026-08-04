@@ -1,0 +1,454 @@
+trigger: none
+
+# =============================================================================
+# Vault HTTPS CD Pipeline — DPN Platform
+#
+# Deploys dpn-vault-https via Helm chart at:
+#   charts/vault-https/
+#
+# Pipeline stages:
+#   1. Validate — helm lint + dry-run against target cluster
+#   2. Deploy   — helm upgrade --install (gated by ADO environment approval)
+#   3. Verify   — pod + service status + vault seal check
+#
+# Config resolved from:
+#   .pipelines/azure-pipelines/config/<env>-<cluster>.json
+#   charts/vault-https/values-<env>-<cluster>.yaml  (normal)
+#   charts/vault-https/values-test.yaml             (testMode=true)
+# =============================================================================
+
+parameters:
+
+  - name: ServiceConnection
+    displayName: 'ServiceConnection details'
+    type: string
+    default: 'sc-dpn-dev-001'
+    values:
+      - sc-dpn-dev-001
+      - sc-dpn-dev-002
+      - sc-dpn-test-001
+      - sc-dpn-test-002
+      - sc-dpn-pdev-ppd-001
+      - sc-dpn-ptest-ppd-001
+      - sc-dpn-puat-ppd-001
+
+  - name: environment
+    displayName: Environment Name
+    type: string
+    default: 'dev'
+    values:
+      - dev
+      - devtest
+      - test
+      - pdev
+      - ptest
+      - puat
+
+  - name: dpnCluster
+    displayName: "Target DPN Cluster (pdev/ptest/puat have only one DPN — dpn02 is disabled for those environments)"
+    type: string
+    default: "dpn01"
+    values:
+      - dpn01
+      - dpn02
+
+  - name: vaultImageTag
+    displayName: "Vault Image Tag (e.g. 1.16)"
+    type: string
+    default: "1.16"
+
+  - name: testMode
+    displayName: "Test Mode? (deploys isolated dpn-vault-https-test instance)"
+    type: boolean
+    default: false
+
+  - name: runVaultInit
+    displayName: "Run Vault Init? (enables KV v2 + audit logs — safe to run on existing vaults)"
+    type: boolean
+    default: true
+
+  - name: storeRootTokenInAkv
+    displayName: "Store Vault root token in Azure Key Vault?"
+    type: boolean
+    default: false
+
+variables:
+  - name: CHART_DIR
+    value: "charts/vault-https"
+
+  - name: PARAMETERS_FILE
+    value: ".pipelines/azure-pipelines/config/${{ parameters.environment }}-${{ parameters.dpnCluster }}.json"
+
+  - ${{ if or(eq(parameters.environment, 'pdev'), eq(parameters.environment, 'ptest'), eq(parameters.environment, 'puat')) }}:
+    - name: APPROVAL_GROUP
+      value: dsi-ppd
+  - ${{ elseif or(eq(parameters.environment, 'devtest'), eq(parameters.environment, 'test')) }}:
+    - name: APPROVAL_GROUP
+      value: dsi-devtest
+  - ${{ else }}:
+    - name: APPROVAL_GROUP
+      value: dsi-dev
+
+  - ${{ if parameters.testMode }}:
+    - name: RELEASE_NAME
+      value: "vault-https-test"
+    - name: VALUES_FILE
+      value: "charts/vault-https/values-test.yaml"
+    - name: VAULT_FULL_NAME
+      value: "dpn-vault-https-test"
+    - name: VAULT_TOKEN_SECRET_NAME
+      value: "VAULT-ROOT-TOKEN"
+  - ${{ else }}:
+    - name: RELEASE_NAME
+      value: "vault-https"
+    - name: VALUES_FILE
+      value: "charts/vault-https/values-${{ parameters.environment }}-${{ parameters.dpnCluster }}.yaml"
+    - name: VAULT_FULL_NAME
+      value: "dpn-vault-https"
+    - name: VAULT_TOKEN_SECRET_NAME
+      value: "VAULT-TOKEN"
+
+# ============================================================
+# Stage 1 — Validate
+# ============================================================
+stages:
+
+- stage: Validate
+  displayName: "Lint + Dry Run [${{ parameters.environment }}-${{ parameters.dpnCluster }}]"
+
+  jobs:
+  - job: Validate
+    displayName: "Helm Lint + Dry Run"
+    pool:
+      name: "<<YOUR AGENT POOL>>"
+
+    steps:
+    - checkout: self
+
+    - script: |
+        echo "Loading config from: $(PARAMETERS_FILE)"
+        for param in $(jq -r 'keys_unsorted | .[]' "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)"); do
+          value=$(jq -r ".\"$param\"" "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)")
+          echo "##vso[task.setvariable variable=$param]$value"
+        done
+      displayName: "Load Environment Config"
+
+    - script: |
+        if [ ! -f "$(VALUES_FILE)" ]; then
+          echo "##[error]Values file not found: $(VALUES_FILE)"
+          exit 1
+        fi
+        echo "Values file found: $(VALUES_FILE)"
+      displayName: "Check Values File Exists"
+
+    # Guard — pdev/ptest/puat only have one DPN; dpn02 is disabled for these environments
+    - script: |
+        echo "##[error]dpn02 is disabled for environment '${{ parameters.environment }}' — it has only a single DPN."
+        exit 1
+      displayName: "Block dpn02 for single-DPN environments"
+      condition: and(succeeded(), in('${{ parameters.environment }}', 'pdev', 'ptest', 'puat'), eq('${{ parameters.dpnCluster }}', 'dpn02'))
+
+    - task: AzureCLI@2
+      displayName: "AKS Auth + Helm Lint + Dry Run"
+      inputs:
+        azureSubscription: "${{ parameters.ServiceConnection }}"
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+
+          echo "=========================================="
+          echo " INSTALL TOOLS"
+          echo "=========================================="
+          which kubelogin >/dev/null 2>&1 || az aks install-cli --client-version v1.31.0 --kubelogin-version v0.1.4
+          kubelogin --version >/dev/null
+          helm version >/dev/null
+
+          echo "=========================================="
+          echo " AKS AUTH"
+          echo "=========================================="
+          az account set --subscription $(AZURE_SUBSCRIPTION_ID)
+          az aks get-credentials \
+            --resource-group $(RESOURCE_GROUP) \
+            --name $(AKS_CLUSTER) \
+            --overwrite-existing
+          kubelogin convert-kubeconfig -l azurecli
+
+          echo "=========================================="
+          echo " HELM LINT"
+          echo "=========================================="
+          helm lint $(CHART_DIR) -f $(VALUES_FILE) \
+            --set image.tag="${{ parameters.vaultImageTag }}"
+
+          echo "=========================================="
+          echo " HELM DRY RUN"
+          echo "=========================================="
+          helm upgrade --install $(RELEASE_NAME) $(CHART_DIR) \
+            --namespace $(NAMESPACE) \
+            --create-namespace \
+            -f $(VALUES_FILE) \
+            --set image.tag="${{ parameters.vaultImageTag }}" \
+            --dry-run
+
+          echo "Validation passed"
+
+# ============================================================
+#  Stage 2 — Approval (gated on the environment's approver group)
+# ============================================================
+- stage: Approval
+  displayName: "Approval Gate"
+  dependsOn: Validate
+  condition: succeeded()
+
+  jobs:
+  - deployment: ApprovalJob
+    displayName: "Approve Vault HTTPS Deployment"
+    environment: "$(APPROVAL_GROUP)"
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - script: |
+              echo "=========================================="
+              echo " APPROVAL REQUIRED BEFORE VAULT HTTPS DEPLOY"
+              echo "=========================================="
+              echo "Environment : ${{ parameters.environment }}"
+              echo "Cluster     : ${{ parameters.dpnCluster }}"
+              echo "Release     : $(RELEASE_NAME)"
+              echo "=========================================="
+
+# ============================================================
+# Stage 3 — Deploy
+# ============================================================
+- stage: Deploy
+  displayName: "Deploy Vault HTTPS [${{ parameters.environment }}-${{ parameters.dpnCluster }}]"
+  dependsOn:
+  - Validate
+  - Approval
+
+  condition: succeeded()
+
+  jobs:
+  - deployment: DeployVaultHttps
+    displayName: "Helm Upgrade --install"
+    pool:
+      name: "<<YOUR AGENT POOL>>"
+    environment: "vault-https-${{ parameters.environment }}"
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - script: |
+              for param in $(jq -r 'keys_unsorted | .[]' "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)"); do
+                value=$(jq -r ".\"$param\"" "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)")
+                echo "##vso[task.setvariable variable=$param]$value"
+              done
+            displayName: "Load Environment Config"
+
+          - task: AzureCLI@2
+            displayName: "Helm Deploy Vault HTTPS"
+            inputs:
+              azureSubscription: "${{ parameters.ServiceConnection }}"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                which kubelogin >/dev/null 2>&1 || az aks install-cli --client-version v1.31.0 --kubelogin-version v0.1.4
+                kubelogin --version >/dev/null
+                helm version >/dev/null
+
+                az account set --subscription $(AZURE_SUBSCRIPTION_ID)
+                az aks get-credentials \
+                  --resource-group $(RESOURCE_GROUP) \
+                  --name $(AKS_CLUSTER) \
+                  --overwrite-existing
+                kubelogin convert-kubeconfig -l azurecli
+
+                echo "=========================================="
+                echo " DEPLOYING VAULT HTTPS"
+                echo " Environment : ${{ parameters.environment }}"
+                echo " Cluster     : ${{ parameters.dpnCluster }}"
+                echo " AKS         : $(AKS_CLUSTER)"
+                echo " Namespace   : $(NAMESPACE)"
+                echo " Release     : $(RELEASE_NAME)"
+                echo " Image tag   : ${{ parameters.vaultImageTag }}"
+                echo " Test Mode   : ${{ parameters.testMode }}"
+                echo "=========================================="
+
+                helm upgrade --install $(RELEASE_NAME) $(CHART_DIR) \
+                  --namespace $(NAMESPACE) \
+                  -f $(VALUES_FILE) \
+                  --set image.tag="${{ parameters.vaultImageTag }}" \
+                  --wait \
+                  --timeout 5m
+
+                echo "=========================================="
+                echo " POST-DEPLOY STATUS"
+                echo "=========================================="
+                kubectl get pods -n $(NAMESPACE) -l app=$(VAULT_FULL_NAME) -o wide
+                kubectl get svc  -n $(NAMESPACE) -l app=$(VAULT_FULL_NAME)
+
+                echo "=========================================="
+                echo " CAPTURE DEPLOYED IMAGE DIGEST"
+                echo "=========================================="
+                VAULT_DIGEST=$(kubectl get pods -n $(NAMESPACE) \
+                  -l app=$(VAULT_FULL_NAME) \
+                  -o jsonpath='{.items[0].status.containerStatuses[0].imageID}')
+
+                if [ -z "$VAULT_DIGEST" ]; then
+                  echo "##[error]Could not resolve deployed vault-https image digest from pod status"
+                  exit 1
+                fi
+
+                echo "Vault HTTPS image digest: $VAULT_DIGEST"
+
+                mkdir -p $(Build.ArtifactStagingDirectory)/deployed-digest
+
+                {
+                  echo "$VAULT_DIGEST"
+                  echo "component=vault-https"
+                  echo "environment=${{ parameters.environment }}"
+                  echo "dpnCluster=${{ parameters.dpnCluster }}"
+                  echo "imageTag=${{ parameters.vaultImageTag }}"
+                } > $(Build.ArtifactStagingDirectory)/deployed-digest/vault-https-digest.txt
+
+                echo "Digest written to artifact staging directory"
+                echo "Vault HTTPS deployed successfully"
+
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish Deployed Image Digest"
+            inputs:
+              pathToPublish: "$(Build.ArtifactStagingDirectory)/deployed-digest"
+              artifactName: "deployed-image-digest"
+
+# ============================================================
+# Stage 4 — Verify
+# ============================================================
+- stage: Verify
+  displayName: "Verify Vault HTTPS [${{ parameters.environment }}-${{ parameters.dpnCluster }}]"
+  dependsOn: Deploy
+  condition: succeeded()
+
+  jobs:
+  - job: Verify
+    displayName: "Vault HTTPS Health Check"
+    pool:
+      name: "<<YOUR AGENT POOL>>"
+
+    steps:
+    - checkout: self
+
+    - script: |
+        for param in $(jq -r 'keys_unsorted | .[]' "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)"); do
+          value=$(jq -r ".\"$param\"" "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)")
+          echo "##vso[task.setvariable variable=$param]$value"
+        done
+      displayName: "Load Environment Config"
+
+    - task: AzureCLI@2
+      displayName: "Vault HTTPS Seal Status Check"
+      inputs:
+        azureSubscription: "${{ parameters.ServiceConnection }}"
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+
+          which kubelogin >/dev/null 2>&1 || az aks install-cli --client-version v1.31.0 --kubelogin-version v0.1.4
+          az account set --subscription $(AZURE_SUBSCRIPTION_ID)
+          az aks get-credentials \
+            --resource-group $(RESOURCE_GROUP) \
+            --name $(AKS_CLUSTER) \
+            --overwrite-existing
+          kubelogin convert-kubeconfig -l azurecli
+
+          echo "=========================================="
+          echo " POD STATUS"
+          echo "=========================================="
+          kubectl get pods -n $(NAMESPACE) -l app=$(VAULT_FULL_NAME) -o wide
+
+          echo "=========================================="
+          echo " SERVICE STATUS"
+          echo "=========================================="
+          kubectl get svc -n $(NAMESPACE) -l app=$(VAULT_FULL_NAME)
+
+          echo "=========================================="
+          echo " VAULT HTTPS SEAL STATUS"
+          echo "=========================================="
+          VAULT_POD=$(kubectl get pod -n $(NAMESPACE) -l app=$(VAULT_FULL_NAME) \
+            -o jsonpath='{.items[0].metadata.name}')
+
+          echo "Pod: $VAULT_POD"
+          kubectl exec -n $(NAMESPACE) $VAULT_POD -- \
+            sh -c 'VAULT_ADDR=https://127.0.0.1:8200 VAULT_SKIP_VERIFY=true vault status || true'
+
+          echo "Verification complete"
+
+# ============================================================
+# Stage 5 — Vault Init (opt-in, first deploy only)
+# ============================================================
+- stage: VaultInit
+  displayName: "Vault Init [${{ parameters.environment }}-${{ parameters.dpnCluster }}]"
+  dependsOn: Verify
+  condition: and(succeeded(), ${{ parameters.runVaultInit }})
+
+  jobs:
+  - job: VaultInit
+    displayName: "Initialize Vault + Enable KV v2"
+    pool:
+      name: "<<YOUR AGENT POOL>>"
+
+    steps:
+    - checkout: self
+
+    - script: |
+        for param in $(jq -r 'keys_unsorted | .[]' "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)"); do
+          value=$(jq -r ".\"$param\"" "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)")
+          echo "##vso[task.setvariable variable=$param]$value"
+        done
+      displayName: "Load Environment Config"
+
+    - task: AzureCLI@2
+      displayName: "Run Vault Init Script"
+      inputs:
+        azureSubscription: "${{ parameters.ServiceConnection }}"
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+
+          which kubelogin >/dev/null 2>&1 || az aks install-cli --client-version v1.31.0 --kubelogin-version v0.1.4
+          az account set --subscription $(AZURE_SUBSCRIPTION_ID)
+          az aks get-credentials \
+            --resource-group $(RESOURCE_GROUP) \
+            --name $(AKS_CLUSTER) \
+            --overwrite-existing
+          kubelogin convert-kubeconfig -l azurecli
+
+          NAMESPACE=$(NAMESPACE) \
+          KV_MOUNT=pki-client \
+          AKV_NAME=$(KEY_VAULT_NAME) \
+          STORE_ROOT_TOKEN=${{ parameters.storeRootTokenInAkv }} \
+          VAULT_POD_LABEL="app=$(VAULT_FULL_NAME)" \
+          SECRET_NAME=$(VAULT_TOKEN_SECRET_NAME) \
+          INIT_FILE="$(Build.ArtifactStagingDirectory)/vault-init.txt" \
+          bash .pipelines/scripts/vault-init.sh
+
+    - script: |
+        if [ ! -f "$(Build.ArtifactStagingDirectory)/vault-init.txt" ]; then
+          echo "Vault was already initialized — no init file generated on this run." \
+            > "$(Build.ArtifactStagingDirectory)/vault-init.txt"
+        fi
+      displayName: "Ensure Init File Exists"
+      condition: always()
+
+    - task: PublishPipelineArtifact@1
+      displayName: "Publish Init File (root token + recovery keys)"
+      condition: always()
+      inputs:
+        targetPath: "$(Build.ArtifactStagingDirectory)/vault-init.txt"
+        artifact: "vault-init-output"

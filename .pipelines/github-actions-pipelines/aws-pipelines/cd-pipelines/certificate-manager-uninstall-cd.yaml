@@ -1,0 +1,172 @@
+name: DPN Platform Helm Uninstall
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target Environment
+        type: choice
+        options: [dev, devtest, test]
+        required: true
+
+      cluster:
+        description: Target DPN Cluster
+        type: choice
+        options: [dpn01, dpn02]
+        required: true
+
+      awsRegion:
+        description: AWS Region (passed, not hard-coded)
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  ENVIRONMENT: ${{ inputs.environment }}
+  CLUSTER: ${{ inputs.cluster }}
+  AWS_REGION: ${{ inputs.awsRegion }}
+
+  PARAMETERS_FILE: .pipelines/github-actions-pipelines/aws-pipelines/config/${{ inputs.environment }}-${{ inputs.cluster }}.json
+
+# ==========================================================
+# STAGE 0 — PRECHECK (MANUAL CONFIRMATION)
+# ==========================================================
+jobs:
+  Precheck:
+    name: Pre-Uninstall Checklist
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Operator Checklist
+        run: |
+          echo "PRE-UNINSTALL CHECKLIST"
+          echo "--------------------------------------------------"
+          echo "✔ Federator CI pipelines STOPPED"
+          echo "✔ Federator CD pipelines STOPPED"
+          echo "✔ No active ingestion"
+          echo "✔ Kafka topics drained/validated"
+          echo "✔ Required backups completed"
+          echo ""
+          echo "Do NOT proceed unless all checks are TRUE."
+
+# ==========================================================
+# STAGE 1 — PREPARE (LOAD CONFIG + EKS CONTEXT)
+# ==========================================================
+  Prepare:
+    name: Prepare EKS Context
+    runs-on: ubuntu-latest
+    needs: Precheck
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load Environment Config
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f "$PARAMETERS_FILE" ]]; then
+            echo "ERROR: Config file not found: $PARAMETERS_FILE"
+            exit 1
+          fi
+
+          jq -r 'keys[]' "$PARAMETERS_FILE" | while read key; do
+            echo "$key=$(jq -r ".\"$key\"" "$PARAMETERS_FILE")" >> $GITHUB_ENV
+          done
+
+      - name: AWS Authentication
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: $AWS_REGION
+
+      - name: Configure EKS Context
+        shell: bash
+        run: |
+          aws eks update-kubeconfig \
+            --name "$EKS_CLUSTER_NAME" \
+            --region "$AWS_REGION"
+
+          kubectl get nodes
+
+# ==========================================================
+# STAGE 2 — APPROVAL (EXPLICIT DELETION SCOPE)
+# ==========================================================
+  Approval:
+    name: Approval - Confirm Deletion Scope
+    runs-on: ubuntu-latest
+    needs: Prepare
+    environment: certificate-manager-aws-${{ inputs.environment }}
+
+    steps:
+      - name: Preview Helm Releases (READ ONLY)
+        shell: bash
+        run: |
+          echo "===================================================="
+          echo "DPN PLATFORM UNINSTALL — APPROVAL REQUIRED"
+          echo "===================================================="
+          echo "Target Namespace: $NAMESPACE"
+          echo ""
+          echo "Helm releases that WILL BE DELETED:"
+          echo "----------------------------------------------------"
+
+          helm list -n "$NAMESPACE" -q \
+            | grep '^dpn-certificate-manager' || echo "None found"
+
+          echo ""
+          echo "NO resources deleted in this stage."
+          echo "Deletion occurs ONLY after approval."
+          echo "===================================================="
+
+# ==========================================================
+# STAGE 3 — UNINSTALL
+# ==========================================================
+  Uninstall:
+    name: Helm Uninstall DPN Components
+    runs-on: ubuntu-latest
+    needs: Approval
+
+    steps:
+      - name: Helm Uninstall
+        shell: bash
+        run: |
+          echo "Uninstalling Helm releases in namespace: $NAMESPACE"
+
+          helm list -n "$NAMESPACE" -q \
+            | grep '^dpn-certificate-manager' \
+            | while read -r release; do
+                echo "Uninstalling Helm release: $release"
+                helm uninstall "$release" -n "$NAMESPACE"
+              done
+
+# ==========================================================
+# STAGE 4 — FINAL VERIFICATION
+# ==========================================================
+  Verify:
+    name: Final Verification
+    runs-on: ubuntu-latest
+    needs: Uninstall
+
+    steps:
+      - name: Verify Platform Removal
+        shell: bash
+        run: |
+          echo "Deployments remaining:"
+          kubectl get deployments -n "$NAMESPACE" || true
+
+          echo ""
+          echo "Pods remaining:"
+          kubectl get pods -n "$NAMESPACE" || true
+
+          echo ""
+          echo "Helm releases remaining:"
+          helm list -n "$NAMESPACE"
+
+          echo ""
+          echo "Services (may still exist):"
+          kubectl get svc -n "$NAMESPACE" || true
+
+          echo "===================================================="
+          echo "DPN PLATFORM UNINSTALL VERIFICATION COMPLETE"
+          echo "===================================================="

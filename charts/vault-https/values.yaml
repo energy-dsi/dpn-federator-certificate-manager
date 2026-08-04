@@ -1,0 +1,76 @@
+# =============================================================================
+# Vault HTTPS Helm Chart — Base Values
+# Override per environment using values-<env>-<cluster>.yaml
+# =============================================================================
+
+# -----------------------------
+# Naming
+# -----------------------------
+fullnameOverride: "dpn-vault-https"
+namespace: "ns-dpn-01"
+
+# -----------------------------
+# Image
+# -----------------------------
+image:
+  repository: ""
+  tag: "1.16"
+  pullPolicy: IfNotPresent
+
+# -----------------------------
+# Replicas — keep at 1 (ReadWriteOnce PVC)
+# -----------------------------
+replicaCount: 1
+
+# -----------------------------
+# Persistence
+# -----------------------------
+persistence:
+  size: 5Gi
+  storageClassName: default
+
+# -----------------------------
+# Service
+# -----------------------------
+service:
+  aliasEnabled: true      # set false for test instances to avoid conflict with live vault-https service
+  lb:
+    enabled: true
+    annotations:
+      service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+    externalTrafficPolicy: Local
+
+# -----------------------------
+# Vault runtime config — HTTPS only
+# -----------------------------
+vault:
+  storagePath: "/vault/file"
+
+# -----------------------------
+# Auto-Unseal — Azure Key Vault
+# -----------------------------
+seal:
+  azureKeyVault:
+    tenantId: ""
+    clientId: ""
+    keyVaultName: ""
+    keyName: "vault-unseal-key"
+
+# -----------------------------
+# AKV CSI — pulls TLS cert + key from Key Vault
+# -----------------------------
+keyvault:
+  clientID: ""
+  name: ""
+  tenantId: ""
+
+# -----------------------------
+# Resources
+# -----------------------------
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

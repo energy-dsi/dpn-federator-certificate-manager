@@ -1,0 +1,76 @@
+{{- $name := include "certificate-manager.name" . }}
+# =============================================================================
+# Certificate Manager — ConfigMap
+# Non-sensitive runtime configuration only.
+# Secrets (passwords, tokens) live in the Secret resource.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-config
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "certificate-manager.labels" . | nindent 4 }}
+data:
+  SPRING_APPLICATION_NAME: "certificate-manager"
+
+  # ---- Vault ----------------------------------------------------------------
+  VAULT_URI:              {{ .Values.vault.uri | quote }}
+  {{- if .Values.vaultTruststore.secretName }}
+  SPRING_CLOUD_VAULT_SSL_TRUST_STORE: "file:{{ .Values.vaultTruststore.mountPath }}/truststore.jks"
+  {{- end }}
+  VAULT_AUTHENTICATION:   {{ .Values.vault.authentication | quote }}
+  VAULT_AUTH_ROLE:        {{ .Values.vault.authRole | quote }}
+  VAULT_PKI_MOUNT:        {{ .Values.vault.pkiMount | quote }}
+  VAULT_SECRET_PATH:      {{ .Values.vault.secretPath | quote }}
+
+  # ---- mTLS keystores -------------------------------------------------------
+  MTLS_KEYSTORE_PATH:     {{ .Values.mtls.keystorePath | quote }}
+  MTLS_TRUSTSTORE_PATH:   {{ .Values.mtls.truststorePath | quote }}
+  MTLS_KEYSTORE_TYPE:     {{ .Values.mtls.keystoreType | quote }}
+
+  # ---- Certificate destination ----------------------------------------------
+  CERT_DEST_PATH:                     {{ .Values.certDest.path | quote }}
+  CERT_DEST_KEYSTORE_FILE:            {{ .Values.certDest.keystoreFile | quote }}
+  CERT_DEST_TRUSTSTORE_FILE:          {{ .Values.certDest.truststoreFile | quote }}
+  CERT_DEST_KEYSTORE_PASSWORD_FILE:   {{ .Values.certDest.keystorePasswordFile | quote }}
+  CERT_DEST_TRUSTSTORE_PASSWORD_FILE: {{ .Values.certDest.truststorePasswordFile | quote }}
+  CERT_DEST_KEYSTORE_ALIAS:           {{ .Values.certDest.keystoreAlias | quote }}
+
+  # ---- OAuth2 ---------------------------------------------------------------
+  OAUTH2_TOKEN_URI:     {{ .Values.oauth2.tokenUri | quote }}
+  OAUTH2_CLIENT_ID:     {{ .Values.oauth2.clientId | quote }}
+  OAUTH2_AUTH_MODE:     {{ .Values.oauth2.authMode | quote }}
+  OAUTH2_JWT_ALGORITHM: {{ .Values.oauth2.jwtAlgorithm | quote }}
+
+  # ---- Management Node ------------------------------------------------------
+  MANAGEMENT_NODE_BASE_URL: {{ .Values.managementNode.baseUrl | quote }}
+
+  # ---- Scheduling -----------------------------------------------------------
+  CERT_RENEWAL_RATE: {{ .Values.cert.renewalRateMs | quote }}
+  CERT_SYNC_RATE:    {{ .Values.cert.syncRateMs | quote }}
+
+  # ---- Certificate subject --------------------------------------------------
+  CERT_RENEWAL_THRESHOLD:         {{ .Values.cert.renewalThresholdDays | quote }}
+  CERT_KEY_SIZE:                  {{ .Values.cert.keySize | quote }}
+  CERT_SUBJECT_COUNTRY:           {{ .Values.cert.subject.country | quote }}
+  CERT_SUBJECT_STATE:             {{ .Values.cert.subject.state | quote }}
+  CERT_SUBJECT_LOCALITY:          {{ .Values.cert.subject.locality | quote }}
+  CERT_SUBJECT_ORG:               {{ .Values.cert.subject.org | quote }}
+  CERT_SUBJECT_OU:                {{ .Values.cert.subject.ou | quote }}
+  CERT_SUBJECT_CN:                {{ .Values.cert.subject.cn | quote }}
+  CERT_SUBJECT_ALT_NAMES:         {{ .Values.cert.subject.altNames | quote }}
+  BOOTSTRAP_OID:                  {{ .Values.cert.bootstrapOid | quote }}
+  CERT_INTERMEDIATE_MIN_VALID_DAYS: {{ .Values.cert.intermediateMinValidDays | quote }}
+
+  # ---- Logging --------------------------------------------------------------
+  LOG_LEVEL_SPRING_SECURITY: {{ .Values.logging.levelSpringSecurity | quote }}
+  LOG_LEVEL_APP:             {{ .Values.logging.levelApp | quote }}
+  LOG_LEVEL_RESILIENCE4J:    {{ .Values.logging.levelResilience4j | quote }}
+
+  # ---- OTEL --------------------------------------------------------------
+  OTEL_SERVICE_NAME:           {{ .Values.otel.env.OTEL_SERVICE_NAME | quote }}
+  OTEL_TRACES_ENABLED:         {{ .Values.otel.env.OTEL_TRACES_ENABLED | quote }}
+  OTEL_TRACES_SAMPLER_ARG:     {{ .Values.otel.env.OTEL_TRACES_SAMPLER_ARG | quote }}
+  OTEL_EXPORTER_OTLP_ENDPOINT: {{ .Values.otel.env.OTEL_EXPORTER_OTLP_ENDPOINT | quote }}
+  OTEL_HEARTBEAT_INTERVAL_SECONDS: {{ .Values.otel.env.OTEL_HEARTBEAT_INTERVAL_SECONDS | quote }}

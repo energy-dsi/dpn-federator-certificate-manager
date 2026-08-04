@@ -1,0 +1,21 @@
+# =============================================================================
+# Vault HTTPS — dev-dpn01 values
+# ACR  : <<CONTAINER_REGISTRY_URL>>
+# AKS  : <<your specific value>>
+# Sub  : <<your specific value>>
+# =============================================================================
+
+image:
+  repository: "<<CONTAINER_REGISTRY_URL>>/hashicorp/vault"
+
+seal:
+  azureKeyVault:
+    tenantId: "<<your specific value>>"
+    clientId: "<<your specific value>>"
+    keyVaultName: "<<your specific value>>"
+    keyName: "vault-unseal-key"
+
+keyvault:
+  clientID: "<<your specific value>>"
+  name: "<<your specific value>>"
+  tenantId: "<<your specific value>>"

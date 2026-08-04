@@ -1,0 +1,103 @@
+{{- $name := include "certificate-manager.name" . }}
+# =============================================================================
+# Certificate Manager — Deployment
+#
+# - Runs as non-root (uid 10001)
+# - Mounts shared Azure file share at /tls for keystore/truststore output
+# - Reads config from ConfigMap; secrets from Secret (or existingSecret)
+# - No Service Account / workload identity — file share auth uses storage key
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "certificate-manager.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "certificate-manager.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "certificate-manager.labels" . | nindent 8 }}
+    spec:
+      # No serviceAccountName — no workload identity required
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+
+      containers:
+        - name: certificate-manager
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+
+          env:
+            - name: JAVA_OPTS
+              value: {{ .Values.javaOpts | quote }}
+
+          envFrom:
+            - configMapRef:
+                name: {{ $name }}-config
+            - secretRef:
+                name: {{ include "certificate-manager.secretName" . }}
+
+          volumeMounts:
+            - name: tls-fileshare
+              mountPath: /tls
+            - name: tmp
+              mountPath: /app/tmp
+            - name: logs
+              mountPath: /app/logs
+            - name: kv-secrets-store
+              mountPath: /mnt/secrets
+              readOnly: true
+            {{- if .Values.vaultTruststore.secretName }}
+            - name: vault-truststore
+              mountPath: {{ .Values.vaultTruststore.mountPath }}
+              readOnly: true
+            {{- end }}
+
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "pgrep -f app.jar > /dev/null"
+            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+            failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
+
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "pgrep -f app.jar > /dev/null"
+            initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+            failureThreshold: {{ .Values.readinessProbe.failureThreshold }}
+
+      volumes:
+        - name: tls-fileshare
+          persistentVolumeClaim:
+            claimName: {{ .Values.fileShare.pvcName }}
+        - name: tmp
+          emptyDir: {}
+        - name: logs
+          emptyDir: {}
+        {{- if .Values.vaultTruststore.secretName }}
+        - name: vault-truststore
+          secret:
+            secretName: {{ .Values.vaultTruststore.secretName }}
+        {{- end }}
+        - name: kv-secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: dpn-certificate-manager-kv-secrets

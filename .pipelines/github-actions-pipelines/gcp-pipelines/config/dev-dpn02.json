@@ -1,0 +1,13 @@
+{
+  "ENV_NAME": "<environment-name>",
+  "ARTIFACT_REGISTRY_REPO": "<artifact-registry-repo-name>",
+  "ARTIFACT_REGISTRY_URL": "<region>-docker.pkg.dev/<gcp-project-id>/<artifact-registry-repo-name>",
+  "BASE_REGISTRY": "<region>-docker.pkg.dev/<gcp-project-id>/<artifact-registry-repo-name>",
+  "GCP_PROJECT": "<gcp-project-id>",
+  "GCP_REGION": "<gcp-region>",
+  "GKE_CLUSTER": "<gke-cluster-name>",
+  "GKE_CLUSTER_REGION": "<gke-cluster-region>",
+  "NAMESPACE": "<kubernetes-namespace>",
+  "SECRET_MANAGER_NAME": "<secret-manager-name>"
+}
+ 

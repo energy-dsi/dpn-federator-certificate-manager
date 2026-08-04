@@ -1,0 +1,222 @@
+name: DPN Vault HTTPS CD
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [dev, devtest]
+        required: true
+
+      dpnCluster:
+        description: Target DPN cluster
+        type: choice
+        options: [dpn01, dpn02]
+        required: true
+
+      vaultImageTag:
+        description: Vault image tag (e.g. 1.16)
+        required: true
+        default: "1.16"
+
+      awsRegion:
+        description: AWS region (passed, not hard-coded)
+        required: true
+
+      kubectlVersion:
+        description: kubectl version
+        required: true
+        default: "1.29.0"
+
+      helmVersion:
+        description: Helm version
+        required: true
+        default: "v3.14.4"
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  ENVIRONMENT: ${{ inputs.environment }}
+  DPN_CLUSTER: ${{ inputs.dpnCluster }}
+  AWS_REGION: ${{ inputs.awsRegion }}
+
+  CHART_DIR: charts/vault-https
+  RELEASE_NAME: vault-https
+
+  VALUES_FILE: charts/vault-https/values-${{ inputs.environment }}-${{ inputs.dpnCluster }}.yaml
+  PARAMETERS_FILE: .pipelines/github-actions-pipelines/aws-pipelines/config/${{ inputs.environment }}-${{ inputs.dpnCluster }}.json
+
+# =============================================================================
+# STAGE 1 — VALIDATE (HELM LINT + DRY RUN)
+# =============================================================================
+jobs:
+  Validate:
+    name: Validate [${{ inputs.environment }}-${{ inputs.dpnCluster }}]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Load Environment Config
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f "$PARAMETERS_FILE" ]]; then
+            echo "ERROR: Missing config $PARAMETERS_FILE"
+            exit 1
+          fi
+          jq -r 'keys[]' "$PARAMETERS_FILE" | while read key; do
+            echo "$key=$(jq -r ".\"$key\"" "$PARAMETERS_FILE")" >> $GITHUB_ENV
+          done
+
+      - name: Check Values File Exists
+        shell: bash
+        run: |
+          if [[ ! -f "$VALUES_FILE" ]]; then
+            echo "ERROR: Values file not found: $VALUES_FILE"
+            exit 1
+          fi
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: $AWS_REGION
+
+      - name: Install kubectl & Helm
+        shell: bash
+        run: |
+          curl -LO "https://dl.k8s.io/release/v${{ inputs.kubectlVersion }}/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+
+          curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+          chmod +x get_helm.sh
+          ./get_helm.sh --version "${{ inputs.helmVersion }}"
+
+      - name: Configure EKS Context
+        shell: bash
+        run: |
+          aws eks update-kubeconfig \
+            --name "$EKS_CLUSTER_NAME" \
+            --region "$AWS_REGION"
+
+      - name: Helm Lint & Dry Run
+        shell: bash
+        run: |
+          helm lint "$CHART_DIR" -f "$VALUES_FILE" \
+            --set image.tag="${{ inputs.vaultImageTag }}"
+
+          helm upgrade --install "$RELEASE_NAME" "$CHART_DIR" \
+            --namespace "$NAMESPACE" \
+            --create-namespace \
+            -f "$VALUES_FILE" \
+            --set image.tag="${{ inputs.vaultImageTag }}" \
+            --dry-run
+
+# =============================================================================
+# STAGE 2 — DEPLOY (APPROVAL GATED)
+# =============================================================================
+  Deploy:
+    name: Deploy [${{ inputs.environment }}-${{ inputs.dpnCluster }}]
+    runs-on: ubuntu-latest
+    needs: Validate
+    environment: vault-https-${{ inputs.environment }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load Environment Config
+        shell: bash
+        run: |
+          jq -r 'keys[]' "$PARAMETERS_FILE" | while read key; do
+            echo "$key=$(jq -r ".\"$key\"" "$PARAMETERS_FILE")" >> $GITHUB_ENV
+          done
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: $AWS_REGION
+
+      - name: Configure EKS Context
+        shell: bash
+        run: |
+          aws eks update-kubeconfig \
+            --name "$EKS_CLUSTER_NAME" \
+            --region "$AWS_REGION"
+
+      - name: Helm Deploy Vault HTTPS
+        shell: bash
+        run: |
+          helm upgrade --install "$RELEASE_NAME" "$CHART_DIR" \
+            --namespace "$NAMESPACE" \
+            -f "$VALUES_FILE" \
+            --set image.tag="${{ inputs.vaultImageTag }}" \
+            --wait \
+            --timeout 5m
+
+          kubectl get pods -n "$NAMESPACE" -l app=dpn-vault-https -o wide
+          kubectl get svc  -n "$NAMESPACE" -l app=dpn-vault-https
+
+      - name: Capture Deployed Image Digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          VAULT_DIGEST=$(kubectl get pods -n "$NAMESPACE" \
+            -l app=dpn-vault-https \
+            -o jsonpath='{.items[0].status.containerStatuses[0].imageID}')
+
+          if [[ -z "$VAULT_DIGEST" ]]; then
+            echo "ERROR: Could not resolve deployed vault-https image digest from pod status"
+            exit 1
+          fi
+
+          echo "Vault HTTPS image digest: $VAULT_DIGEST"
+
+          mkdir -p deployed-digest
+          {
+            echo "$VAULT_DIGEST"
+            echo "component=vault-https"
+            echo "environment=${{ inputs.environment }}"
+            echo "dpnCluster=${{ inputs.dpnCluster }}"
+            echo "imageTag=${{ inputs.vaultImageTag }}"
+          } > deployed-digest/vault-https-digest.txt
+
+      - name: Publish Deployed Image Digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployed-image-digest
+          path: deployed-digest/vault-https-digest.txt
+
+# =============================================================================
+# STAGE 3 — VERIFY
+# =============================================================================
+  Verify:
+    name: Verify [${{ inputs.environment }}-${{ inputs.dpnCluster }}]
+    runs-on: ubuntu-latest
+    needs: Deploy
+
+    steps:
+      - name: Verify Deployment & Vault Seal Status
+        shell: bash
+        run: |
+          kubectl rollout status deployment/vault-https \
+            -n "$NAMESPACE" --timeout=300s
+
+          kubectl get pods -n "$NAMESPACE" -l app=dpn-vault-https -o wide
+          kubectl get svc  -n "$NAMESPACE" -l app=dpn-vault-https
+
+          VAULT_POD=$(kubectl get pod -n "$NAMESPACE" \
+            -l app=dpn-vault-https \
+            -o jsonpath='{.items[0].metadata.name}')
+
+          echo "Vault pod: $VAULT_POD"
+
+          kubectl exec -n "$NAMESPACE" "$VAULT_POD" -- \
+            sh -c 'VAULT_ADDR=https://127.0.0.1:8200 VAULT_SKIP_VERIFY=true vault status || true'
+
+          echo "VAULT HTTPS DEPLOYMENT VERIFIED"

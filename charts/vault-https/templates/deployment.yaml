@@ -1,0 +1,86 @@
+{{- $name := .Values.fullnameOverride | default .Release.Name }}
+# =============================================================================
+# Vault HTTPS — Deployment
+#
+# - TLS cert + key mounted directly from AKV via CSI at /vault/tls
+# - Auto-unseal via Azure Key Vault seal stanza in vault.hcl
+# - AZURE_CLIENT_ID set for user-assigned managed identity
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ $name }}
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ $name }}
+  template:
+    metadata:
+      labels:
+        app: {{ $name }}
+        app.kubernetes.io/name: {{ $name }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      securityContext:
+        runAsNonRoot: false
+        fsGroup: 1000
+
+      containers:
+        - name: vault
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+          command: ["vault", "server", "-config=/vault/config/vault.hcl"]
+
+          ports:
+            - name: https
+              containerPort: 8200
+              protocol: TCP
+
+          env:
+            - name: VAULT_ADDR
+              value: "https://127.0.0.1:8200"
+            - name: VAULT_API_ADDR
+              value: "https://0.0.0.0:8200"
+            - name: VAULT_SKIP_VERIFY
+              value: "true"
+            - name: AZURE_CLIENT_ID
+              value: "{{ .Values.seal.azureKeyVault.clientId }}"
+
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+          volumeMounts:
+            - name: vault-data
+              mountPath: {{ .Values.vault.storagePath }}
+            - name: vault-config
+              mountPath: /vault/config
+              readOnly: true
+            - name: vault-tls
+              mountPath: /vault/tls
+              readOnly: true
+
+      volumes:
+        - name: vault-data
+          persistentVolumeClaim:
+            claimName: {{ $name }}-data
+        - name: vault-config
+          configMap:
+            name: {{ $name }}-config
+        - name: vault-tls
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ $name }}-kv-secrets

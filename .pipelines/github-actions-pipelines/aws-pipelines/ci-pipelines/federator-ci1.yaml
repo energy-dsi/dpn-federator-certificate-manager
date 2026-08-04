@@ -1,0 +1,215 @@
+name: DPN Federator CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deployment environment
+        type: choice
+        options: [dev, devtest, test]
+        required: true
+
+      cluster:
+        description: Target cluster
+        type: choice
+        options: [dpn01, dpn02]
+        required: true
+
+      enablePIT:
+        description: Enable PIT mutation tests
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  ENVIRONMENT: ${{ inputs.environment }}
+  CLUSTER: ${{ inputs.cluster }}
+
+  CLIENT_IMAGE: dpn-federator-client
+  SERVER_IMAGE: dpn-federator-server
+  IMAGE_TAG: ${{ github.run_number }}
+
+  PARAMETERS_FILE: .pipelines/github-actions-pipelines/aws-pipelines/config/${{ inputs.environment }}-${{ inputs.cluster }}.json
+  COSIGN_URL: https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+
+jobs:
+  Build_Test_Sign:
+    name: Build, Test, Push & Sign
+    runs-on: ubuntu-latest
+
+    steps:
+      # ------------------------------------------------
+      # CHECKOUT
+      # ------------------------------------------------
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------
+      # LOAD ENV CONFIG FROM JSON
+      # ------------------------------------------------
+      - name: Load Environment Config
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f "$PARAMETERS_FILE" ]]; then
+            echo "ERROR: Config file not found: $PARAMETERS_FILE"
+            exit 1
+          fi
+
+          jq -r 'keys[]' "$PARAMETERS_FILE" | while read key; do
+            echo "$key=$(jq -r ".\"$key\"" "$PARAMETERS_FILE")" >> $GITHUB_ENV
+          done
+
+      # ------------------------------------------------
+      # SETUP JAVA
+      # ------------------------------------------------
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # ------------------------------------------------
+      # MAVEN CONFIG
+      # ------------------------------------------------
+      - name: Configure Maven Settings
+        shell: bash
+        run: |
+          mkdir -p ~/.m2
+          cat <<EOF > ~/.m2/settings.xml
+          <settings>
+            <servers>
+              <server>
+                <id>github</id>
+                <username>${GITHUB_MAVEN_USERNAME}</username>
+                <password>${GITHUB_MAVEN_TOKEN}</password>
+              </server>
+            </servers>
+          </settings>
+          EOF
+
+      # ------------------------------------------------
+      # DOCKERHUB LOGIN (BASE IMAGES)
+      # ------------------------------------------------
+      - name: DockerHub Login
+        shell: bash
+        run: |
+          echo "$DOCKERHUB_PASSWORD" | docker login \
+            -u "$DOCKERHUB_USERNAME" --password-stdin
+
+      # ------------------------------------------------
+      # MAVEN BUILD & TESTS
+      # ------------------------------------------------
+      - name: Maven Build & Tests
+        shell: bash
+        run: mvn clean verify
+
+      # ------------------------------------------------
+      # OPTIONAL PIT TESTS
+      # ------------------------------------------------
+      - name: PIT Mutation Tests
+        if: ${{ inputs.enablePIT }}
+        shell: bash
+        run: mvn org.pitest:pitest-maven:mutationCoverage
+
+      # ------------------------------------------------
+      # REGISTRY LOGIN (GENERIC)
+      # ------------------------------------------------
+      - name: Registry Login
+        shell: bash
+        run: |
+          echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY_URL" \
+            --username "$REGISTRY_USERNAME" \
+            --password-stdin
+
+      # ------------------------------------------------
+      # BUILD CLIENT IMAGE
+      # ------------------------------------------------
+      - name: Build Client Image
+        shell: bash
+        run: |
+          docker build \
+            --build-arg BASE_REGISTRY="$BASE_REGISTRY" \
+            --build-arg GITHUB_MAVEN_USERNAME="$GITHUB_MAVEN_USERNAME" \
+            --build-arg GITHUB_MAVEN_TOKEN="$GITHUB_MAVEN_TOKEN" \
+            -f Dockerfile.client \
+            -t "$REGISTRY_URL/$CLIENT_IMAGE:$IMAGE_TAG" .
+
+      # ------------------------------------------------
+      # BUILD SERVER IMAGE
+      # ------------------------------------------------
+      - name: Build Server Image
+        shell: bash
+        run: |
+          docker build \
+            --build-arg BASE_REGISTRY="$BASE_REGISTRY" \
+            --build-arg GITHUB_MAVEN_USERNAME="$GITHUB_MAVEN_USERNAME" \
+            --build-arg GITHUB_MAVEN_TOKEN="$GITHUB_MAVEN_TOKEN" \
+            -f Dockerfile.server \
+            -t "$REGISTRY_URL/$SERVER_IMAGE:$IMAGE_TAG" .
+
+      # ------------------------------------------------
+      # PUSH IMAGES
+      # ------------------------------------------------
+      - name: Push Images
+        shell: bash
+        run: |
+          docker push "$REGISTRY_URL/$CLIENT_IMAGE:$IMAGE_TAG"
+          docker push "$REGISTRY_URL/$SERVER_IMAGE:$IMAGE_TAG"
+
+      # ------------------------------------------------
+      # COSIGN — KEEP EXACTLY AS ORIGINAL
+      # ------------------------------------------------
+      - name: Restore Cosign Key
+        shell: bash
+        run: |
+          echo "${{ secrets.COSIGN_KEY }}" > cosign.key
+          chmod 600 cosign.key
+
+      - name: Install Cosign
+        shell: bash
+        run: |
+          curl -sSL "$COSIGN_URL" -o cosign
+          chmod +x cosign
+          sudo mv cosign /usr/local/bin/
+          cosign version
+
+      - name: Capture Image Digests
+        shell: bash
+        run: |
+          CLIENT_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$REGISTRY_URL/$CLIENT_IMAGE:$IMAGE_TAG")
+          SERVER_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$REGISTRY_URL/$SERVER_IMAGE:$IMAGE_TAG")
+
+          echo "$CLIENT_DIGEST" > client-image-digest.txt
+          echo "$SERVER_DIGEST" > server-image-digest.txt
+
+          echo "CLIENT_DIGEST=$CLIENT_DIGEST" >> $GITHUB_ENV
+          echo "SERVER_DIGEST=$SERVER_DIGEST" >> $GITHUB_ENV
+
+      - name: Sign Images with Cosign
+        shell: bash
+        env:
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          cosign sign --key cosign.key "$CLIENT_DIGEST"
+          cosign sign --key cosign.key "$SERVER_DIGEST"
+
+      - name: Upload Image Digests
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-digests
+          path: |
+            client-image-digest.txt
+            server-image-digest.txt
+
+      # ------------------------------------------------
+      # CLEANUP (ALWAYS)
+      # ------------------------------------------------
+      - name: Cleanup Docker
+        if: always()
+        shell: bash
+        run: |
+          docker rmi "$REGISTRY_URL/$CLIENT_IMAGE:$IMAGE_TAG" || true
+          docker rmi "$REGISTRY_URL/$SERVER_IMAGE:$IMAGE_TAG" || true

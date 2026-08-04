@@ -1,0 +1,315 @@
+trigger: none
+
+# =============================================================================
+# Certificate Manager CD Pipeline — DPN Platform
+#
+# Deploys the dpn-federator-certificate-manager via the Helm chart at:
+#   charts/certificate-manager/
+#
+# Pipeline stages:
+#   1. Validate   — helm lint + dry-run against target cluster
+#   2. Deploy     — helm upgrade --install (gated by ADO environment approval)
+#   3. Verify     — rollout status + keystore file presence check
+#
+# Matrix of targets (matches existing vault-cd.yaml pattern):
+#   environment : dev | devtest
+#   cluster     : dpn01 | dpn02
+#
+# Config resolved from:
+#   .pipelines/azure-pipelines/config/<env>-<cluster>.json
+#   charts/certificate-manager/values-<env>-<cluster>.yaml
+#
+# Secrets injected at deploy time from Azure Key Vault — never in values files.
+# =============================================================================
+
+parameters:
+
+  - name: serviceConnection
+    displayName: "Azure Service Connection"
+    type: string
+    default: "sc-dpn-dev-001"
+    values:
+      - sc-dpn-dev-001
+      - sc-dpn-dev-002
+      - sc-dpn-sit-001
+      - sc-dpn-sit-002
+
+  - name: environment
+    displayName: "Environment"
+    type: string
+    default: "dev"
+    values:
+      - dev
+      - devtest
+
+  - name: dpnCluster
+    displayName: "Target DPN Cluster"
+    type: string
+    default: "dpn01"
+    values:
+      - dpn01
+      - dpn02
+
+  - name: imageTag
+    displayName: "Certificate Manager Image Tag (Build ID)"
+    type: string
+
+  - name: vaultInitEnabled
+    displayName: "Run Vault Init Job (first deploy only — enable if Vault engines not yet set up)"
+    type: boolean
+    default: false
+
+variables:
+  CHART_DIR:       "charts/certificate-manager"
+  RELEASE_NAME:    "certificate-manager"
+  VALUES_FILE:     "charts/certificate-manager/values-${{ parameters.environment }}-${{ parameters.dpnCluster }}.yaml"
+  PARAMETERS_FILE: ".pipelines/azure-pipelines/config/${{ parameters.environment }}-${{ parameters.dpnCluster }}.json"
+
+# =============================================================================
+# Stage 1 — Validate (Lint + Dry Run)
+# =============================================================================
+stages:
+
+- stage: Validate
+  displayName: "Lint + Dry Run [${{ parameters.environment }}-${{ parameters.dpnCluster }}]"
+
+  jobs:
+  - job: Validate
+    displayName: "Helm Lint + Dry Run"
+    pool:
+      name: "<<YOUR AGENT POOL>>"
+
+    steps:
+    - checkout: self
+
+    - script: |
+        echo "Loading config from: $(PARAMETERS_FILE)"
+        for param in $(jq -r 'keys_unsorted | .[]' "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)"); do
+          value=$(jq -r ".\"$param\"" "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)")
+          echo "##vso[task.setvariable variable=$param]$value"
+        done
+      displayName: "Load Environment Config"
+
+    - task: AzureCLI@2
+      displayName: "AKS Auth + Helm Lint + Dry Run"
+      inputs:
+        azureSubscription: "${{ parameters.serviceConnection }}"
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+
+          echo "=========================================="
+          echo " INSTALL TOOLS"
+          echo "=========================================="
+          az aks install-cli
+          kubelogin --version >/dev/null
+          helm version >/dev/null
+          echo "Tools ready"
+
+          echo "=========================================="
+          echo " AKS AUTH"
+          echo "=========================================="
+          az account set --subscription $(AZURE_SUBSCRIPTION_ID)
+          az aks get-credentials \
+            --resource-group $(RESOURCE_GROUP) \
+            --name $(AKS_CLUSTER) \
+            --overwrite-existing
+          kubelogin convert-kubeconfig -l azurecli
+          echo "AKS context: $(AKS_CLUSTER)"
+
+          echo "=========================================="
+          echo " HELM LINT"
+          echo "=========================================="
+          helm lint $(CHART_DIR) -f $(VALUES_FILE) \
+            --set image.tag="${{ parameters.imageTag }}"
+
+          echo "=========================================="
+          echo " HELM DRY RUN"
+          echo "=========================================="
+          helm upgrade --install $(RELEASE_NAME) $(CHART_DIR) \
+            --namespace $(NAMESPACE) \
+            --create-namespace \
+            -f $(VALUES_FILE) \
+            --set image.tag="${{ parameters.imageTag }}" \
+            --set vaultInitJob.enabled=${{ parameters.vaultInitEnabled }} \
+            --dry-run
+
+          echo "Validation passed"
+
+# =============================================================================
+# Stage 2 — Deploy
+# =============================================================================
+- stage: Deploy
+  displayName: "Deploy CLM [${{ parameters.environment }}-${{ parameters.dpnCluster }}]"
+  dependsOn: Validate
+  condition: succeeded()
+
+  jobs:
+  - deployment: DeployCertManager
+    displayName: "Helm Upgrade --install"
+    pool:
+      name: "<<YOUR AGENT POOL>>"
+    # ADO Environments — add approval gates in the ADO portal
+    # Create environments: certificate-manager-dev, certificate-manager-devtest
+    environment: "certificate-manager-${{ parameters.environment }}"
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - script: |
+              echo "Loading config from: $(PARAMETERS_FILE)"
+              for param in $(jq -r 'keys_unsorted | .[]' "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)"); do
+                value=$(jq -r ".\"$param\"" "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)")
+                echo "##vso[task.setvariable variable=$param]$value"
+              done
+            displayName: "Load Environment Config"
+
+          - task: AzureCLI@2
+            displayName: "Helm Deploy Certificate Manager"
+            inputs:
+              azureSubscription: "${{ parameters.serviceConnection }}"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                echo "=========================================="
+                echo " INSTALL TOOLS"
+                echo "=========================================="
+                az aks install-cli
+                kubelogin --version >/dev/null
+                helm version >/dev/null
+
+                echo "=========================================="
+                echo " AKS AUTH"
+                echo "=========================================="
+                az account set --subscription $(AZURE_SUBSCRIPTION_ID)
+                az aks get-credentials \
+                  --resource-group $(RESOURCE_GROUP) \
+                  --name $(AKS_CLUSTER) \
+                  --overwrite-existing
+                kubelogin convert-kubeconfig -l azurecli
+
+                echo "=========================================="
+                echo " DEPLOYING CERTIFICATE MANAGER"
+                echo " Environment : ${{ parameters.environment }}"
+                echo " Cluster     : ${{ parameters.dpnCluster }}"
+                echo " AKS         : $(AKS_CLUSTER)"
+                echo " Namespace   : $(NAMESPACE)"
+                echo " Image tag   : ${{ parameters.imageTag }}"
+                echo " Vault Init  : ${{ parameters.vaultInitEnabled }}"
+                echo "=========================================="
+
+                helm upgrade --install $(RELEASE_NAME) $(CHART_DIR) \
+                  --namespace $(NAMESPACE) \
+                  --create-namespace \
+                  -f $(VALUES_FILE) \
+                  --set image.tag="${{ parameters.imageTag }}" \
+                  --set vaultInitJob.enabled=${{ parameters.vaultInitEnabled }} \
+                  --wait \
+                  --timeout 5m
+
+                echo "=========================================="
+                echo " POST-DEPLOY STATUS"
+                echo "=========================================="
+                kubectl get pods -n $(NAMESPACE) -l app=certificate-manager -o wide
+                kubectl get pvc  -n $(NAMESPACE)
+                echo "Certificate Manager deployed successfully"
+
+# =============================================================================
+# Stage 3 — Verify
+# =============================================================================
+- stage: Verify
+  displayName: "Verify CLM [${{ parameters.environment }}-${{ parameters.dpnCluster }}]"
+  dependsOn: Deploy
+  condition: succeeded()
+
+  jobs:
+  - job: Verify
+    displayName: "Rollout + Keystore Health Check"
+    pool:
+      name: "<<YOUR AGENT POOL>>"
+
+    steps:
+    - checkout: self
+
+    - script: |
+        echo "Loading config from: $(PARAMETERS_FILE)"
+        for param in $(jq -r 'keys_unsorted | .[]' "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)"); do
+          value=$(jq -r ".\"$param\"" "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)")
+          echo "##vso[task.setvariable variable=$param]$value"
+        done
+      displayName: "Load Environment Config"
+
+    - task: AzureCLI@2
+      displayName: "Rollout + File Share Verification"
+      inputs:
+        azureSubscription: "${{ parameters.serviceConnection }}"
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+
+          az aks install-cli
+          az account set --subscription $(AZURE_SUBSCRIPTION_ID)
+          az aks get-credentials \
+            --resource-group $(RESOURCE_GROUP) \
+            --name $(AKS_CLUSTER) \
+            --overwrite-existing
+          kubelogin convert-kubeconfig -l azurecli
+
+          echo "=========================================="
+          echo " ROLLOUT STATUS"
+          echo "=========================================="
+          kubectl rollout status deployment/certificate-manager \
+            -n $(NAMESPACE) \
+            --timeout=300s
+
+          echo "=========================================="
+          echo " POD STATUS"
+          echo "=========================================="
+          kubectl get pods -n $(NAMESPACE) -l app=certificate-manager -o wide
+
+          echo "=========================================="
+          echo " PVC STATUS"
+          echo "=========================================="
+          kubectl get pvc -n $(NAMESPACE) -l app.kubernetes.io/name=certificate-manager
+
+          echo "=========================================="
+          echo " KEYSTORE PRESENCE CHECK"
+          echo " (wait up to 120s for CLM first-run write)"
+          echo "=========================================="
+          CLM_POD=$(kubectl get pod -n $(NAMESPACE) \
+            -l app=certificate-manager \
+            -o jsonpath='{.items[0].metadata.name}')
+          echo "Pod: $CLM_POD"
+
+          for i in $(seq 1 12); do
+            KS=$(kubectl exec -n $(NAMESPACE) "$CLM_POD" -- \
+              sh -c 'ls /tls/keystore.p12 /tls/truststore.p12 2>/dev/null | wc -l')
+            if [ "$KS" -eq "2" ]; then
+              echo "✓ keystore.p12 and truststore.p12 found in /tls"
+              break
+            fi
+            echo "Attempt $i/12 — keystores not yet written, waiting 10s..."
+            sleep 10
+          done
+
+          if [ "$KS" -ne "2" ]; then
+            echo "✗ Keystores not found after 120s — check CLM logs"
+            kubectl logs -n $(NAMESPACE) "$CLM_POD" --tail=50
+            exit 1
+          fi
+
+          echo "=========================================="
+          echo " HELM STATUS"
+          echo "=========================================="
+          helm status $(RELEASE_NAME) -n $(NAMESPACE)
+
+          echo "=========================================="
+          echo " CERTIFICATE MANAGER DEPLOYMENT VERIFIED"
+          echo "=========================================="

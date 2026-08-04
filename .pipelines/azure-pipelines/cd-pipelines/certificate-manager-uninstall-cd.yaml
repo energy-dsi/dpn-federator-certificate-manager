@@ -1,0 +1,237 @@
+trigger: none
+
+# =============================================================================
+# Certificate Manager Uninstall Pipeline
+#
+# Helm uninstalls the selected component(s) from the target cluster.
+# Releases:
+#   certificate-manager  ->  dpn-certificate-manager
+#   vault-https          ->  vault-https
+# =============================================================================
+
+parameters:
+
+  - name: ServiceConnection
+    displayName: 'ServiceConnection details'
+    type: string
+    default: 'sc-dpn-dev-001'
+    values:
+      - sc-dpn-dev-001
+      - sc-dpn-dev-002
+      - sc-dpn-test-001
+      - sc-dpn-test-002
+      - sc-dpn-pdev-ppd-001
+      - sc-dpn-ptest-ppd-001
+      - sc-dpn-puat-ppd-001
+
+  - name: environment
+    displayName: Environment Name
+    type: string
+    default: 'dev'
+    values:
+      - dev
+      - devtest
+      - test
+      - pdev
+      - ptest
+      - puat
+
+  - name: dpnCluster
+    displayName: "Target DPN Cluster (pdev/ptest/puat have only one DPN — dpn02 is disabled for those environments)"
+    type: string
+    default: dpn01
+    values:
+      - dpn01
+      - dpn02
+
+  - name: component
+    displayName: "Component to Uninstall"
+    type: string
+    default: certificate-manager
+    values:
+      - certificate-manager
+      - vault-https
+      - both
+
+variables:
+  - name: PARAMETERS_FILE
+    value: ".pipelines/azure-pipelines/config/${{ parameters.environment }}-${{ parameters.dpnCluster }}.json"
+
+  - ${{ if or(eq(parameters.environment, 'pdev'), eq(parameters.environment, 'ptest'), eq(parameters.environment, 'puat')) }}:
+    - name: APPROVAL_GROUP
+      value: dsi-ppd
+  - ${{ elseif or(eq(parameters.environment, 'devtest'), eq(parameters.environment, 'test')) }}:
+    - name: APPROVAL_GROUP
+      value: dsi-devtest
+  - ${{ else }}:
+    - name: APPROVAL_GROUP
+      value: dsi-dev
+
+# =============================================================================
+# Stage 1 — Guard (pdev/ptest/puat only have one DPN; dpn02 is disabled)
+# =============================================================================
+stages:
+- stage: GuardSingleDpn
+  displayName: "Guard — Single DPN Environments"
+  # This guard runs on EVERY run and FAILS only for the invalid combo. Do NOT
+  # re-add a stage-level `condition:` here — a skipped guard makes the downstream
+  # `condition: succeeded()` stages skip too (a skip is NOT a success), which
+  # silently skips the whole pipeline (the pdev+dpn01 no-op runs).
+  jobs:
+  - job: Block
+    pool:
+      name: <<YOUR AGENT POOL>>
+    steps:
+    - script: |
+        ENV="${{ parameters.environment }}"
+        CLUSTER="${{ parameters.dpnCluster }}"
+        if printf '%s' "$ENV" | grep -qE '^(pdev|ptest|puat)$' && [ "$CLUSTER" = "dpn02" ]; then
+          echo "##[error]dpn02 is disabled for environment '$ENV' — it has only a single DPN."
+          exit 1
+        fi
+        echo "Guard passed: environment '$ENV' with cluster '$CLUSTER' is a valid combination."
+      displayName: "Validate DPN cluster for environment"
+
+# =============================================================================
+# Stage 2 — Approval (gated on the environment's approver group)
+# =============================================================================
+- stage: Approval
+  displayName: "Approval Gate"
+
+  jobs:
+  - deployment: ApprovalJob
+    displayName: "Approve Certificate Manager Uninstall"
+    pool:
+      name: <<YOUR AGENT POOL>>
+    environment: "$(APPROVAL_GROUP)"
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - script: |
+              echo "===================================================="
+              echo " APPROVAL REQUIRED BEFORE UNINSTALL"
+              echo "===================================================="
+              echo "Environment : ${{ parameters.environment }}"
+              echo "Cluster     : ${{ parameters.dpnCluster }}"
+              echo "Component   : ${{ parameters.component }}"
+              echo "===================================================="
+
+# =============================================================================
+# Stage 3 — Uninstall
+# =============================================================================
+- stage: Uninstall
+  displayName: "Uninstall [${{ parameters.environment }}-${{ parameters.dpnCluster }}] — ${{ parameters.component }}"
+  dependsOn:
+  - GuardSingleDpn
+  - Approval
+  condition: succeeded()
+
+  jobs:
+  - deployment: UninstallJob
+    displayName: "Helm Uninstall"
+    pool:
+      name: <<YOUR AGENT POOL>>
+    environment: "certificate-manager-${{ parameters.environment }}"
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - script: |
+              echo "Loading config from: $(PARAMETERS_FILE)"
+              for param in $(jq -r 'keys_unsorted | .[]' "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)"); do
+                value=$(jq -r ".\"$param\"" "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)")
+                echo "##vso[task.setvariable variable=$param]$value"
+              done
+            displayName: "Load Environment Config"
+
+          - task: AzureCLI@2
+            displayName: "Helm Uninstall — ${{ parameters.component }}"
+            inputs:
+              azureSubscription: "${{ parameters.ServiceConnection }}"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                which kubelogin >/dev/null 2>&1 || az aks install-cli
+                kubelogin --version >/dev/null
+                helm version >/dev/null
+                az account set --subscription $(AZURE_SUBSCRIPTION_ID)
+                az aks get-credentials \
+                  --resource-group $(RESOURCE_GROUP) \
+                  --name $(AKS_CLUSTER) \
+                  --overwrite-existing
+                kubelogin convert-kubeconfig -l azurecli
+
+                uninstall() {
+                  local release=$1
+                  if helm status "$release" -n $(NAMESPACE) >/dev/null 2>&1; then
+                    echo "Uninstalling: $release"
+                    helm uninstall "$release" -n $(NAMESPACE)
+                    echo "$release uninstalled successfully"
+                  else
+                    echo "$release not found in $(NAMESPACE) — skipping"
+                  fi
+                }
+
+                if [ "${{ parameters.component }}" = "certificate-manager" ] || [ "${{ parameters.component }}" = "both" ]; then
+                  uninstall "dpn-certificate-manager"
+                fi
+
+                if [ "${{ parameters.component }}" = "vault-https" ] || [ "${{ parameters.component }}" = "both" ]; then
+                  uninstall "vault-https"
+                fi
+
+# =============================================================================
+# Stage 4 — Verify
+# =============================================================================
+- stage: Verify
+  displayName: "Verify Removal"
+  dependsOn: Uninstall
+  condition: succeeded()
+
+  jobs:
+  - job: Verify
+    displayName: "Check Remaining Helm Releases"
+    pool:
+      name: <<YOUR AGENT POOL>>
+
+    steps:
+    - checkout: self
+
+    - script: |
+        echo "Loading config from: $(PARAMETERS_FILE)"
+        for param in $(jq -r 'keys_unsorted | .[]' "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)"); do
+          value=$(jq -r ".\"$param\"" "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)")
+          echo "##vso[task.setvariable variable=$param]$value"
+        done
+      displayName: "Load Environment Config"
+
+    - task: AzureCLI@2
+      displayName: "List Remaining Helm Releases"
+      inputs:
+        azureSubscription: "${{ parameters.ServiceConnection }}"
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+
+          which kubelogin >/dev/null 2>&1 || az aks install-cli
+          kubelogin --version >/dev/null
+          helm version >/dev/null
+          az account set --subscription $(AZURE_SUBSCRIPTION_ID)
+          az aks get-credentials \
+            --resource-group $(RESOURCE_GROUP) \
+            --name $(AKS_CLUSTER) \
+            --overwrite-existing
+          kubelogin convert-kubeconfig -l azurecli
+
+          echo "Remaining Helm releases in $(NAMESPACE):"
+          helm list -n $(NAMESPACE)
+
+          echo "Remaining pods in $(NAMESPACE):"
+          kubectl get pods -n $(NAMESPACE)
