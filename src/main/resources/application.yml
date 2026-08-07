@@ -19,12 +19,6 @@ application:
   vault:
     pki-mount: ${VAULT_PKI_MOUNT:pki-client}
     secret-path: ${VAULT_SECRET_PATH:node-net/client}
-  client:
-    key-store: ${MTLS_KEYSTORE_PATH:/home/developer/Downloads/managementNode/docker/keystore.jks}
-    trust-store: ${MTLS_TRUSTSTORE_PATH:/home/developer/Downloads/managementNode/docker/truststore.jks}
-    key-store-password: ${MTLS_KEYSTORE_PASSWORD:changeit}
-    trust-store-password: ${MTLS_TRUSTSTORE_PASSWORD:changeit}
-    key-store-type: ${MTLS_KEYSTORE_TYPE:JKS}
   oauth2:
     token-uri: ${OAUTH2_TOKEN_URI:https://localhost:8443/realms/mng-node/protocol/openid-connect/token}
     client-id: ${OAUTH2_CLIENT_ID:MANAGEMENT_NODE_CLIENT}
@@ -53,20 +47,11 @@ application:
     bootstrap-oid: ${BOOTSTRAP_OID:1.3.6.1.4.1.32473.1.1}
     intermediate:
       min-valid-days: ${CERT_INTERMEDIATE_MIN_VALID_DAYS:14}
-    destination:
-      # Base directory path where all certificate files will be written
-      path: ${CERT_DEST_PATH:/home/developer/test-secrets/}
-      # Filenames for PKCS12 keystore and truststore
-      keystore-file: ${CERT_DEST_KEYSTORE_FILE:keystore.p12}
-      truststore-file: ${CERT_DEST_TRUSTSTORE_FILE:truststore.p12}
-      # Passwords for PKCS12 keystore and truststore (if not set, resolved from Vault or auto-generated)
-      keystore-password: ${CERT_DEST_KEYSTORE_PASSWORD:}
-      truststore-password: ${CERT_DEST_TRUSTSTORE_PASSWORD:}
-      # File names for generated passwords (will be stored in the same directory as the keystore/truststore)
-      keystore-password-file: ${CERT_DEST_KEYSTORE_PASSWORD_FILE:keystore.password}
-      truststore-password-file: ${CERT_DEST_TRUSTSTORE_PASSWORD_FILE:truststore.password}
-      # Alias for the identity key in the keystore
-      keystore-alias: ${CERT_DEST_KEYSTORE_ALIAS:federator}
+    # Identity used when building the in-memory mTLS keystore/truststore from Vault material.
+    # No files are written to disk — certificate manager and federator both read the
+    # certificate material directly from Vault (the Azure SMB file share has been removed).
+    identity:
+      keystore-alias: ${CERT_KEYSTORE_ALIAS:federator}
 
 resilience4j:
   retry:

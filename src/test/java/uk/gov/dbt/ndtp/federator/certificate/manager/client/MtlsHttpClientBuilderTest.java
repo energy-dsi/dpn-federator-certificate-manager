@@ -7,35 +7,43 @@
 package uk.gov.dbt.ndtp.federator.certificate.manager.client;
 
 import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.verify;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.when;
 
-import java.io.FileOutputStream;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.security.KeyStore;
-import java.util.Map;
+import java.math.BigInteger;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.PrivateKey;
+import java.security.PublicKey;
+import java.security.cert.X509Certificate;
+import java.util.Date;
+import java.util.List;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.io.BasicHttpClientConnectionManager;
+import org.bouncycastle.asn1.x500.X500Name;
+import org.bouncycastle.cert.X509v3CertificateBuilder;
+import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
+import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder;
+import org.bouncycastle.operator.ContentSigner;
+import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
-import org.springframework.test.util.ReflectionTestUtils;
 import uk.gov.dbt.ndtp.federator.certificate.manager.config.CertificateProperties;
-import uk.gov.dbt.ndtp.federator.certificate.manager.config.CertificateProperties.Destination;
+import uk.gov.dbt.ndtp.federator.certificate.manager.exception.RestClientConfigurationException;
+import uk.gov.dbt.ndtp.federator.certificate.manager.model.dto.CreateKeyResponseDTO;
+import uk.gov.dbt.ndtp.federator.certificate.manager.service.pki.KeyStoreService;
 import uk.gov.dbt.ndtp.federator.certificate.manager.service.pki.VaultSecretProvider;
+import uk.gov.dbt.ndtp.federator.certificate.manager.service.pki.cryptography.PemUtil;
 
+/**
+ * Verifies that the mTLS client is assembled entirely from Vault-held certificate material with
+ * no keystore/truststore files on disk (the Azure SMB file share has been removed).
+ */
 @ExtendWith(MockitoExtension.class)
 class MtlsHttpClientBuilderTest {
-
-    @InjectMocks
-    MtlsHttpClientBuilder builder;
 
     @Mock
     VaultSecretProvider vaultSecretProvider;
@@ -43,74 +51,83 @@ class MtlsHttpClientBuilderTest {
     @Mock
     CertificateProperties certificateProperties;
 
-    private Path keyStoreFile;
-    private Path trustStoreFile;
+    MtlsHttpClientBuilder builder;
 
-    private static final String PASSWORD = "password";
-    private static final String TYPE = "JKS";
+    private String caPem;
+    private String leafPem;
+    private String privateKeyPem;
+    private String publicKeyPem;
 
     @BeforeEach
     void setUp() throws Exception {
-        keyStoreFile = createTempKeyStore();
-        trustStoreFile = createTempKeyStore();
-        ReflectionTestUtils.setField(builder, "keyStorePath", keyStoreFile.toString());
-        ReflectionTestUtils.setField(builder, "trustStorePath", trustStoreFile.toString());
-        ReflectionTestUtils.setField(builder, "keyStorePassword", PASSWORD);
-        ReflectionTestUtils.setField(builder, "trustStorePassword", PASSWORD);
-        ReflectionTestUtils.setField(builder, "keyStoreType", "JKS");
+        builder = new MtlsHttpClientBuilder(vaultSecretProvider, new KeyStoreService(), certificateProperties);
+
+        KeyPairGenerator kpg = KeyPairGenerator.getInstance("RSA");
+        kpg.initialize(2048);
+        KeyPair caKeyPair = kpg.generateKeyPair();
+        KeyPair leafKeyPair = kpg.generateKeyPair();
+
+        X500Name caName = new X500Name("CN=CA");
+        X500Name leafName = new X500Name("CN=federator.dpn.local");
+        X509Certificate caCert = createCert(caName, caName, caKeyPair.getPublic(), caKeyPair.getPrivate());
+        X509Certificate leafCert = createCert(leafName, caName, leafKeyPair.getPublic(), caKeyPair.getPrivate());
+
+        caPem = PemUtil.toPem("CERTIFICATE", caCert.getEncoded());
+        leafPem = PemUtil.toPem("CERTIFICATE", leafCert.getEncoded());
+        privateKeyPem = PemUtil.toPem("PRIVATE KEY", leafKeyPair.getPrivate().getEncoded());
+        publicKeyPem = PemUtil.toPem("PUBLIC KEY", leafKeyPair.getPublic().getEncoded());
+    }
+
+    private void stubVault() {
+        when(certificateProperties.getIdentity()).thenReturn(identityWithAlias("federator"));
+        when(vaultSecretProvider.getCertificate()).thenReturn(leafPem);
+        when(vaultSecretProvider.getKeyPair())
+                .thenReturn(CreateKeyResponseDTO.builder()
+                        .privateKeyPem(privateKeyPem)
+                        .publicKeyPem(publicKeyPem)
+                        .build());
+        when(vaultSecretProvider.getCaChain()).thenReturn(List.of(caPem));
     }
 
     @Test
-    void buildConnectionManager_withConfigPassword() {
-        Destination mockConfig = mock(CertificateProperties.Destination.class);
-        when(mockConfig.getKeystorePassword()).thenReturn(PASSWORD);
-        when(certificateProperties.getDestination()).thenReturn(mockConfig);
+    void buildConnectionManager_fromVaultMaterial() {
+        stubVault();
         BasicHttpClientConnectionManager connectionManager = builder.buildConnectionManager();
-
         assertNotNull(connectionManager);
     }
 
     @Test
-    void buildConnectionManager_withVaultPassword() {
-        Map<String, Object> secret = Map.of(PASSWORD, PASSWORD);
-        when(vaultSecretProvider.getSecret("keystore-password")).thenReturn(secret);
-        when(vaultSecretProvider.getSecret("truststore-password")).thenReturn(secret);
-        Destination mockConfig = mock(CertificateProperties.Destination.class);
-        when(certificateProperties.getDestination()).thenReturn(mockConfig);
-
-        BasicHttpClientConnectionManager connectionManager = builder.buildConnectionManager();
-
-        assertNotNull(connectionManager);
-        verify(vaultSecretProvider, times(2)).getSecret(any());
-    }
-
-    @Test
-    void buildConnectionManager_WithPassword() {
-        BasicHttpClientConnectionManager connectionManager = builder.buildConnectionManager(PASSWORD, PASSWORD);
-
-        assertNotNull(connectionManager);
-    }
-
-    @Test
-    void buildHttpClient() {
-        Destination mockConfig = mock(CertificateProperties.Destination.class);
-        when(mockConfig.getKeystorePassword()).thenReturn(PASSWORD);
-        when(certificateProperties.getDestination()).thenReturn(mockConfig);
+    void buildHttpClient_fromVaultMaterial() {
+        stubVault();
         CloseableHttpClient httpClient = builder.buildHttpClient();
-
         assertNotNull(httpClient);
     }
 
-    private Path createTempKeyStore() throws Exception {
-        KeyStore ks = KeyStore.getInstance(TYPE);
-        ks.load(null, PASSWORD.toCharArray());
+    @Test
+    void buildConnectionManager_failsWhenCertificateMissing() {
+        when(vaultSecretProvider.getCertificate()).thenReturn(null);
+        when(vaultSecretProvider.getKeyPair())
+                .thenReturn(CreateKeyResponseDTO.builder()
+                        .privateKeyPem(privateKeyPem)
+                        .build());
+        when(vaultSecretProvider.getCaChain()).thenReturn(List.of(caPem));
+        assertThrows(RestClientConfigurationException.class, () -> builder.buildConnectionManager());
+    }
 
-        Path file = Files.createTempFile("test-keystore", ".jks");
+    private static CertificateProperties.Identity identityWithAlias(String alias) {
+        CertificateProperties.Identity identity = new CertificateProperties.Identity();
+        identity.setKeystoreAlias(alias);
+        return identity;
+    }
 
-        try (FileOutputStream fos = new FileOutputStream(file.toFile())) {
-            ks.store(fos, PASSWORD.toCharArray());
-        }
-
-        return file;
+    private X509Certificate createCert(X500Name subject, X500Name issuer, PublicKey pubKey, PrivateKey privKey)
+            throws Exception {
+        long now = System.currentTimeMillis();
+        Date start = new Date(now);
+        Date end = new Date(now + 1000000);
+        ContentSigner signer = new JcaContentSignerBuilder("SHA256withRSA").build(privKey);
+        X509v3CertificateBuilder certBuilder =
+                new JcaX509v3CertificateBuilder(issuer, BigInteger.valueOf(now), start, end, subject, pubKey);
+        return new JcaX509CertificateConverter().getCertificate(certBuilder.build(signer));
     }
 }

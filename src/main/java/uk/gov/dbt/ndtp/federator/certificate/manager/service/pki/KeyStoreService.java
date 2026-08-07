@@ -80,6 +80,33 @@ public class KeyStoreService {
      * @return the serialized PKCS12 truststore as a byte array
      * @throws Exception if truststore creation or serialization fails
      */
+    public byte[] createTrustStore(List<String> caChain, String password) {
+        try {
+            KeyStore ks = KeyStore.getInstance("PKCS12");
+            ks.load(null, null);
+            if (caChain != null) {
+                for (int i = 0; i < caChain.size(); i++) {
+                    X509Certificate caCert = PemUtil.parseCertificate(caChain.get(i));
+                    ks.setCertificateEntry("ca-" + i, caCert);
+                }
+            }
+            return storeKeyStore(ks, password);
+        } catch (PkiException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new PkiException("Failed to create truststore", e);
+        }
+    }
+
+    /**
+     * Creates a PKCS12 truststore containing a list of CA certificates, merging into an existing
+     * on-disk truststore if present.
+     *
+     * @param caChain the list of CA certificates in PEM format
+     * @param password the password for the truststore
+     * @param existingTrustStore path to an existing truststore to merge into, if it exists
+     * @return the serialized PKCS12 truststore as a byte array
+     */
     public byte[] createTrustStore(List<String> caChain, String password, Path existingTrustStore) {
         try {
             KeyStore ks = KeyStore.getInstance("PKCS12");
