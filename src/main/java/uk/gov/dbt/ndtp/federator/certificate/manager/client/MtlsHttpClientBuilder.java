@@ -6,13 +6,15 @@
 
 package uk.gov.dbt.ndtp.federator.certificate.manager.client;
 
-import java.io.FileInputStream;
+import java.io.ByteArrayInputStream;
 import java.security.KeyStore;
+import java.security.SecureRandom;
 import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
+import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Enumeration;
-import java.util.Map;
-import java.util.Optional;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import javax.net.ssl.KeyManager;
 import javax.net.ssl.KeyManagerFactory;
@@ -32,67 +34,67 @@ import org.apache.hc.core5.http.config.Lookup;
 import org.apache.hc.core5.http.config.RegistryBuilder;
 import org.apache.hc.core5.util.TimeValue;
 import org.apache.hc.core5.util.Timeout;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import uk.gov.dbt.ndtp.federator.certificate.manager.config.CertificateProperties;
 import uk.gov.dbt.ndtp.federator.certificate.manager.exception.RestClientConfigurationException;
+import uk.gov.dbt.ndtp.federator.certificate.manager.model.dto.CreateKeyResponseDTO;
+import uk.gov.dbt.ndtp.federator.certificate.manager.service.pki.KeyStoreService;
 import uk.gov.dbt.ndtp.federator.certificate.manager.service.pki.VaultSecretProvider;
 
 /**
- * Service that builds a HTTP connection manager, client and REST client from a local keystore and truststore.
+ * Builds an mTLS-enabled HTTP client whose keystore and truststore are constructed
+ * <strong>in memory</strong> from the certificate material stored in Vault.
+ * <p>
+ *     No keystore/truststore files are read from disk — the Azure SMB file share previously
+ *     shared between the certificate manager and the federator has been removed. The identity
+ *     (leaf certificate + private key + CA chain) and the trust anchors (CA chain) are fetched
+ *     from Vault on demand and assembled into transient {@link KeyStore} instances protected by
+ *     an ephemeral, process-local password that never leaves memory.
+ * </p>
  */
 @Component
 @RequiredArgsConstructor
 @Slf4j
 public class MtlsHttpClientBuilder {
-    @Value("${application.client.key-store}")
-    private String keyStorePath;
 
-    @Value("${application.client.key-store-password}")
-    private String keyStorePassword;
-
-    @Value("${application.client.trust-store}")
-    private String trustStorePath;
-
-    @Value("${application.client.trust-store-password}")
-    private String trustStorePassword;
-
-    @Value("${application.client.key-store-type:JKS}")
-    private String keyStoreType;
+    private static final String PKCS_12 = "PKCS12";
+    private static final SecureRandom RANDOM = new SecureRandom();
 
     private final VaultSecretProvider vaultSecretProvider;
+    private final KeyStoreService keyStoreService;
     private final CertificateProperties certificateProperties;
-    private static final String PASSWORD = "password";
 
     /**
-     * Builds a connection manager from a known keystore and truststore.
+     * Builds a connection manager whose SSL context is derived from Vault-held certificate
+     * material assembled into in-memory key/trust stores.
      */
     public BasicHttpClientConnectionManager buildConnectionManager() {
-        String latestKeyStorePassword = getKeyStorePassword();
-        String latestTrustStorePassword = getTrustStorePassword();
-        return buildConnectionManager(latestKeyStorePassword, latestTrustStorePassword);
-    }
-
-    /**
-     * Builds a connection manager from a known keystore and truststore.
-     * @param keyStorePassword credentials to access the keystore
-     * @param trustStorePassword credentials to access the truststore
-     * @return
-     */
-    public BasicHttpClientConnectionManager buildConnectionManager(String keyStorePassword, String trustStorePassword) {
         try {
-            KeyStore keyStore = loadKeyStore(keyStorePath, keyStorePassword, keyStoreType);
-            KeyStore trustStore = loadKeyStore(trustStorePath, trustStorePassword, keyStoreType);
-            Enumeration<String> aliases = trustStore.aliases();
-            while (aliases.hasMoreElements()) {
-                String alias = aliases.nextElement();
-                Certificate cert = trustStore.getCertificate(alias);
-                if (cert instanceof X509Certificate x509) {
-                    log.info("Truststore entry: {} -> {}", alias, x509.getSubjectX500Principal());
-                }
+            char[] ephemeralPassword = generateEphemeralPassword();
+            String passwordStr = new String(ephemeralPassword);
+
+            String certificatePem = vaultSecretProvider.getCertificate();
+            CreateKeyResponseDTO keyPair = vaultSecretProvider.getKeyPair();
+            List<String> caChain = resolveCaChain();
+
+            if (certificatePem == null || keyPair == null || keyPair.getPrivateKeyPem() == null) {
+                throw new RestClientConfigurationException(
+                        "Certificate or key pair missing in Vault; cannot build mTLS client");
             }
+
+            String alias = certificateProperties.getIdentity().getKeystoreAlias();
+
+            byte[] keyStoreBytes = keyStoreService.createKeyStore(
+                    keyPair.getPrivateKeyPem(), certificatePem, caChain, passwordStr, alias);
+            KeyStore keyStore = loadInMemoryKeyStore(keyStoreBytes, ephemeralPassword);
+
+            byte[] trustStoreBytes = keyStoreService.createTrustStore(caChain, passwordStr);
+            KeyStore trustStore = loadInMemoryKeyStore(trustStoreBytes, ephemeralPassword);
+
+            logTrustStoreEntries(trustStore);
+
             KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
-            kmf.init(keyStore, keyStorePassword.toCharArray());
+            kmf.init(keyStore, ephemeralPassword);
 
             X509ExtendedKeyManager originalKeyManager = (X509ExtendedKeyManager) kmf.getKeyManagers()[0];
             KeyManager loggingKeyManager = new LoggingKeyManager(originalKeyManager);
@@ -113,17 +115,18 @@ public class MtlsHttpClientBuilder {
                     .build();
 
             BasicHttpClientConnectionManager connectionManager = BasicHttpClientConnectionManager.create(registry);
-
             connectionManager.setConnectionConfig(connectionConfig);
-
             return connectionManager;
+        } catch (RestClientConfigurationException e) {
+            throw e;
         } catch (Exception e) {
             throw new RestClientConfigurationException("Failed to configure mTLS HttpClient", e);
         }
     }
 
     /**
-     * Builds an HTTP client configured with connection manager.
+     * Builds an HTTP client configured with the in-memory mTLS connection manager.
+     *
      * @return an instance of {@link CloseableHttpClient}
      */
     public CloseableHttpClient buildHttpClient() {
@@ -139,48 +142,49 @@ public class MtlsHttpClientBuilder {
                 .build();
     }
 
-    private String getKeyStorePassword() {
-        CertificateProperties.Destination config = certificateProperties.getDestination();
-        String configKeyStorePassword = config.getKeystorePassword();
-        if (configKeyStorePassword != null && !configKeyStorePassword.isBlank()) return configKeyStorePassword;
-
-        Optional<String> vaultKeyStorePassword = getSecretFromVault("keystore-password");
-        if (vaultKeyStorePassword.isPresent()) return vaultKeyStorePassword.get();
-
-        return keyStorePassword;
-    }
-
-    private String getTrustStorePassword() {
-        CertificateProperties.Destination config = certificateProperties.getDestination();
-        String configTrustStorePassword = config.getTruststorePassword();
-        if (configTrustStorePassword != null && !configTrustStorePassword.isBlank()) {
-            return configTrustStorePassword;
+    /**
+     * Resolves the CA chain used for both the keystore chain and the truststore trust anchors,
+     * falling back to the signing (intermediate) CA when no explicit chain is stored.
+     */
+    private List<String> resolveCaChain() {
+        List<String> caChain = vaultSecretProvider.getCaChain();
+        if (caChain != null && !caChain.isEmpty()) {
+            return caChain;
         }
-
-        Optional<String> vaultTrustStorePassword = getSecretFromVault("truststore-password");
-        if (vaultTrustStorePassword.isPresent()) return vaultTrustStorePassword.get();
-
-        return trustStorePassword;
-    }
-
-    private Optional<String> getSecretFromVault(String secretName) {
-        Map<String, Object> secret = vaultSecretProvider.getSecret(secretName);
-        if (secret.containsKey(PASSWORD)) {
-            return Optional.of((String) secret.get(PASSWORD));
+        String intermediateCa = vaultSecretProvider.getIntermediateCa();
+        if (intermediateCa != null && !intermediateCa.isBlank()) {
+            log.info("CA chain is empty in Vault; falling back to signing CA for the mTLS truststore");
+            List<String> fallback = new ArrayList<>();
+            fallback.add(intermediateCa);
+            return fallback;
         }
-        return Optional.empty();
+        return new ArrayList<>();
     }
 
-    private KeyStore loadKeyStore(String path, String password, String type) {
+    private KeyStore loadInMemoryKeyStore(byte[] bytes, char[] password) {
         try {
-            KeyStore ks = KeyStore.getInstance(type);
-            try (FileInputStream fis = new FileInputStream(path)) {
-                ks.load(fis, password.toCharArray());
-            }
-            log.info("Fetched key store.");
+            KeyStore ks = KeyStore.getInstance(PKCS_12);
+            ks.load(new ByteArrayInputStream(bytes), password);
             return ks;
         } catch (Exception e) {
-            throw new RestClientConfigurationException("Failed to load keystore from " + path, e);
+            throw new RestClientConfigurationException("Failed to load in-memory keystore", e);
         }
+    }
+
+    private void logTrustStoreEntries(KeyStore trustStore) throws Exception {
+        Enumeration<String> aliases = trustStore.aliases();
+        while (aliases.hasMoreElements()) {
+            String alias = aliases.nextElement();
+            Certificate cert = trustStore.getCertificate(alias);
+            if (cert instanceof X509Certificate x509) {
+                log.info("Truststore entry: {} -> {}", alias, x509.getSubjectX500Principal());
+            }
+        }
+    }
+
+    private char[] generateEphemeralPassword() {
+        byte[] bytes = new byte[24];
+        RANDOM.nextBytes(bytes);
+        return Base64.getEncoder().encodeToString(bytes).toCharArray();
     }
 }

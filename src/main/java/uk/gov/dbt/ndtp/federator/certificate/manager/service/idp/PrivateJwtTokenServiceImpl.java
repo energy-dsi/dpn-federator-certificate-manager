@@ -1,26 +1,18 @@
 package uk.gov.dbt.ndtp.federator.certificate.manager.service.idp;
 
 
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nimbusds.jose.JOSEObjectType;
 import com.nimbusds.jose.JWSAlgorithm;
 import com.nimbusds.jose.JWSHeader;
 import com.nimbusds.jose.JWSSigner;
 import com.nimbusds.jose.crypto.ECDSASigner;
 import com.nimbusds.jose.crypto.RSASSASigner;
-import com.nimbusds.jose.jwk.RSAKey;
 import com.nimbusds.jwt.JWTClaimsSet;
 import com.nimbusds.jwt.SignedJWT;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import io.github.resilience4j.retry.annotation.Retry;
-import java.io.FileInputStream;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.security.KeyStore;
 import java.security.MessageDigest;
 import java.security.PrivateKey;
-import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
 import java.security.interfaces.ECPrivateKey;
 import java.security.interfaces.RSAPrivateKey;
@@ -28,7 +20,6 @@ import java.time.Instant;
 import java.util.*;
 
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.lang3.StringUtils;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -40,9 +31,9 @@ import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 import org.springframework.web.client.RestClient;
 import uk.gov.dbt.ndtp.federator.certificate.manager.client.MtlsHttpClientBuilder;
-import uk.gov.dbt.ndtp.federator.certificate.manager.config.CertificateProperties;
 import uk.gov.dbt.ndtp.federator.certificate.manager.exception.OAuth2TokenException;
 import uk.gov.dbt.ndtp.federator.certificate.manager.service.pki.VaultSecretProvider;
+import uk.gov.dbt.ndtp.federator.certificate.manager.service.pki.cryptography.PemUtil;
 
 /**
  * Service for requesting OAuth2 tokens from Keycloak using the
@@ -95,8 +86,6 @@ public class PrivateJwtTokenServiceImpl implements OAuth2TokenService {
     private static final String CLIENT_ID             = "client_id";
     private static final String ACCESS_TOKEN          = "access_token";
     private static final String EXPIRES_IN            = "expires_in";
-    private static final String PASSWORD = "password";
-    private static final String PKCS_12 = "PKCS12";
 
     /** Assertion lifetime — Keycloak enforces jti-uniqueness to prevent replays. */
     private static final int ASSERTION_LIFETIME_SECONDS = 60;
@@ -107,7 +96,6 @@ public class PrivateJwtTokenServiceImpl implements OAuth2TokenService {
     private final String clientId;
     private PrivateKey privateKey;
     private final JWSAlgorithm jwsAlgorithm;
-    private final CertificateProperties.Destination config;
 
     /**
      * The {@code kid} derived once at startup from the keystore leaf certificate.
@@ -122,7 +110,6 @@ public class PrivateJwtTokenServiceImpl implements OAuth2TokenService {
      * @param tokenUri                Keycloak token endpoint URI
      * @param clientId                OAuth2 client identifier registered in Keycloak
      * @param algorithm               JWS signing algorithm (e.g. {@code RS256}, {@code ES256})
-     * @param certificateProperties   certificate properties to extract destination props like keystore path, file and alias.
      * @param vaultSecretProvider     vault provider api to retrieve keystore password
      */
     public PrivateJwtTokenServiceImpl(
@@ -130,7 +117,6 @@ public class PrivateJwtTokenServiceImpl implements OAuth2TokenService {
             @Value("${application.oauth2.token-uri}") String tokenUri,
             @Value("${application.oauth2.client-id}") String clientId,
             @Value("${application.oauth2.jwt-algorithm:RS256}") String algorithm,
-            CertificateProperties certificateProperties,
             VaultSecretProvider vaultSecretProvider) {
 
         this.httpClientBuilder = httpClientBuilder;
@@ -138,21 +124,16 @@ public class PrivateJwtTokenServiceImpl implements OAuth2TokenService {
         this.clientId  = clientId;
         this.jwsAlgorithm = resolveAlgorithm(algorithm);
         this.vaultSecretProvider = vaultSecretProvider;
-        this.config = certificateProperties.getDestination();
-
     }
 
     private void initPrivateTwtTokenService() throws OAuth2TokenException {
-        String keystorePath = resolveKeystorePath(config);
-        String keystorePassword = resolveKeystorePassword(config.getKeystorePassword(), "keystore-password");
-
-        KeystoreContents ks = loadKeystoreContents(keystorePath, keystorePassword, config.getKeystoreAlias());
+        KeystoreContents ks = loadKeystoreContentsFromVault();
         this.privateKey = ks.privateKey();
         this.keyId      = ks.kid();
 
         log.info(
                 "PrivateJwtTokenServiceImpl initialised. tokenUri='{}', clientId='{}', "
-                        + "kid='{}' (derived from cert in keystore), algorithm='{}'",
+                        + "kid='{}' (derived from cert in Vault), algorithm='{}'",
                 tokenUri, clientId, keyId, jwsAlgorithm);
     }
     /**
@@ -255,59 +236,39 @@ public class PrivateJwtTokenServiceImpl implements OAuth2TokenService {
     record KeystoreContents(PrivateKey privateKey, String kid) {}
 
     /**
-     * Opens the PKCS12 keystore once, extracts the private key and the leaf certificate,
-     * and derives the {@code kid} from the certificate's SHA-256 thumbprint (RFC 7638).
+     * Reads the private key and leaf certificate <strong>directly from Vault</strong> (no
+     * keystore file on disk) and derives the {@code kid} from the certificate's SHA-256
+     * thumbprint (RFC 7638).
      *
-     * <p>The cert-manager sidecar places the CA-signed certificate at {@code chain[0]}
-     * under the configured alias.  On certificate renewal the keystore is overwritten
-     * in-place; the new {@code kid} is picked up automatically on the next start.</p>
+     * <p>cert-manager persists the CA-signed leaf certificate and the matching key pair to
+     * Vault. On certificate renewal the Vault entries are overwritten; the new {@code kid} is
+     * picked up automatically on the next token request.</p>
      *
-     * @param keystorePath     filesystem path to the PKCS12 keystore
-     * @param keystorePassword keystore password
-     * @param alias            key entry alias
      * @return a {@link KeystoreContents} holding both artefacts
-     * @throws OAuth2TokenException if the keystore cannot be loaded or required entries are missing
+     * @throws OAuth2TokenException if the material cannot be read from Vault or is incomplete
      */
-    static KeystoreContents loadKeystoreContents(String keystorePath, String keystorePassword, String alias) {
-        if (StringUtils.isAnyBlank(keystorePath, keystorePassword, alias)) {
-            throw new OAuth2TokenException(
-                    "private_key_jwt requires: application.private-jwt.keystore-path, "
-                            + "application.private-jwt.keystore-password, application.private-jwt.key-alias");
+    KeystoreContents loadKeystoreContentsFromVault() {
+        String certificatePem = vaultSecretProvider.getCertificate();
+        var keyPair = vaultSecretProvider.getKeyPair();
+        if (certificatePem == null || certificatePem.isBlank()) {
+            throw new OAuth2TokenException("No certificate found in Vault for private_key_jwt assertion signing.");
         }
-
-        try (FileInputStream fis = new FileInputStream(keystorePath)) {
-            KeyStore ks = KeyStore.getInstance(PKCS_12);
-            ks.load(fis, keystorePassword.toCharArray());
-
-            // 1. Private key
-            PrivateKey privateKey = (PrivateKey) ks.getKey(alias, keystorePassword.toCharArray());
-            if (privateKey == null) {
-                throw new OAuth2TokenException(
-                        "No private key for alias '" + alias + "' in keystore: " + keystorePath);
-            }
-
-            // 2. Leaf certificate — cert-manager places the signed cert at chain[0]
-            Certificate[] chain = ks.getCertificateChain(alias);
-            if (chain == null || chain.length == 0) {
-                throw new OAuth2TokenException(
-                        "No certificate chain for alias '" + alias + "' in keystore: " + keystorePath
-                                + ". Has cert-manager completed its first sync job yet?");
-            }
-            X509Certificate leafCert = (X509Certificate) chain[0];
-
-            // 3. Derive kid as SHA-256 thumbprint — identical to what Keycloak computes
-            //    when the certificate is uploaded via the Admin REST API
+        if (keyPair == null || keyPair.getPrivateKeyPem() == null || keyPair.getPrivateKeyPem().isBlank()) {
+            throw new OAuth2TokenException("No private key found in Vault for private_key_jwt assertion signing.");
+        }
+        try {
+            PrivateKey key = PemUtil.parsePkcs8PrivateKey(keyPair.getPrivateKeyPem());
+            X509Certificate leafCert = PemUtil.parseCertificate(certificatePem);
             String kid = deriveKidFromCertificate(leafCert);
-
-            log.info("Keystore loaded from '{}' alias '{}'. Subject: {}, kid: {}",
-                    keystorePath, alias, leafCert.getSubjectX500Principal().getName(), kid);
-
-            return new KeystoreContents(privateKey, kid);
-
+            log.info(
+                    "Loaded private_key_jwt material from Vault. Subject: {}, kid: {}",
+                    leafCert.getSubjectX500Principal().getName(),
+                    kid);
+            return new KeystoreContents(key, kid);
         } catch (OAuth2TokenException e) {
             throw e;
         } catch (Exception e) {
-            throw new OAuth2TokenException("Failed to load keystore from: " + keystorePath, e);
+            throw new OAuth2TokenException("Failed to load private_key_jwt material from Vault", e);
         }
     }
 
@@ -354,36 +315,6 @@ public class PrivateJwtTokenServiceImpl implements OAuth2TokenService {
             default -> throw new OAuth2TokenException(
                     "Unsupported JWT signing algorithm (application.private-jwt.algorithm): " + alg);
         };
-    }
-
-    private String resolveKeystorePath(CertificateProperties.Destination config) {
-        Path basepath = Paths.get(config.getPath());
-        if (Objects.nonNull(basepath) && basepath.toFile().isDirectory()) {
-            String keystoreFile = config.getKeystoreFile();
-            if (keystoreFile != null && !keystoreFile.isBlank()) {
-                return basepath.resolve(keystoreFile).toString();
-            } else {
-                throw new OAuth2TokenException(
-                        "Keystore file name is not a valid: " + keystoreFile);
-            }
-        } else {
-            throw new OAuth2TokenException(
-                    "Keystore base path is not a valid path: " + basepath);
-        }
-    }
-
-    private String resolveKeystorePassword(String configuredPassword, String vaultSuffix) {
-        if (configuredPassword != null && !configuredPassword.isBlank()) {
-            return configuredPassword;
-        }
-
-        Map<String, Object> secret = vaultSecretProvider.getSecret(vaultSuffix);
-        if (secret.containsKey(PASSWORD)) {
-            return (String) secret.get(PASSWORD);
-        }
-
-        throw new OAuth2TokenException(
-                "Keystore password not configured and not found in vault: " + configuredPassword);
     }
 
     /**

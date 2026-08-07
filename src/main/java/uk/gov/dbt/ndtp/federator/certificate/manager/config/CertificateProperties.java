@@ -47,9 +47,12 @@ public class CertificateProperties {
     private Subject subject = new Subject();
 
     /**
-     * The destination configuration for keystore and truststore.
+     * Identity configuration used when building the in-memory mTLS keystore/truststore from
+     * Vault material. No keystore/truststore files are written to disk (the Azure SMB file
+     * share has been removed); both the certificate manager and the federator read the
+     * certificate material directly from Vault.
      */
-    private Destination destination = new Destination();
+    private Identity identity = new Identity();
 
     /**
      * Nested class for certificate subject fields.
@@ -70,48 +73,13 @@ public class CertificateProperties {
     }
 
     /**
-     * Nested class for destination configuration.
+     * Nested class for the in-memory mTLS identity configuration.
      */
     @Getter
     @Setter
-    public static class Destination {
+    public static class Identity {
         /**
-         * The base directory path where all certificate files will be written.
-         */
-        private String path;
-
-        /**
-         * The filename for the PKCS12 keystore.
-         */
-        private String keystoreFile = "keystore.p12";
-
-        /**
-         * The filename for the PKCS12 truststore.
-         */
-        private String truststoreFile = "truststore.p12";
-
-        /**
-         * The password for the PKCS12 keystore. If not provided, it will be generated.
-         */
-        private String keystorePassword;
-
-        /**
-         * The filename for the keystore password.
-         */
-        private String keystorePasswordFile = "keystore.password";
-
-        /**
-         * The password for the PKCS12 truststore. If not provided, it will be generated.
-         */
-        private String truststorePassword;
-
-        /**
-         * The filename for the truststore password.
-         */
-        private String truststorePasswordFile = "truststore.password";
-
-        /**
-         * The alias for the certificate in the keystore.
+         * The alias for the certificate/key entry in the in-memory keystore.
          */
         private String keystoreAlias = "federator";
     }

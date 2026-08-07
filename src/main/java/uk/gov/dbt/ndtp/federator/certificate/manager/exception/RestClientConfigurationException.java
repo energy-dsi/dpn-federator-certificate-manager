@@ -10,6 +10,10 @@ package uk.gov.dbt.ndtp.federator.certificate.manager.exception;
  * Exception thrown when configuring the mTLS RestClient fails.
  */
 public class RestClientConfigurationException extends RuntimeException {
+    public RestClientConfigurationException(String message) {
+        super(message);
+    }
+
     public RestClientConfigurationException(String message, Throwable cause) {
         super(message, cause);
     }

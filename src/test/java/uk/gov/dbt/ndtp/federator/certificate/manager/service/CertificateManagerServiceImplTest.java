@@ -59,9 +59,6 @@ class CertificateManagerServiceImplTest {
     @Mock
     private VaultSecretProvider vaultSecretProvider;
 
-    @Mock
-    private KeyStoreSyncService keyStoreSyncService;
-
     private CertificateProperties certificateProperties;
 
     @InjectMocks
@@ -75,7 +72,7 @@ class CertificateManagerServiceImplTest {
         certificateProperties.getSubject().setCommonName("api.acme-digital.co.uk");
         certificateProperties.getSubject().setCountry("UK");
         certificateManagerService = new CertificateManagerServiceImpl(
-                managementNodeService, pkiService, vaultSecretProvider, certificateProperties, keyStoreSyncService);
+                managementNodeService, pkiService, vaultSecretProvider, certificateProperties);
     }
 
     @Test
@@ -408,19 +405,6 @@ class CertificateManagerServiceImplTest {
         certificateManagerService.run();
 
         verify(pkiService, times(1)).createKeyPair(any(), any());
-    }
-
-    @Test
-    void sync_success() {
-        certificateManagerService.sync();
-        verify(keyStoreSyncService, times(1)).syncKeyStoresToFilesystem();
-    }
-
-    @Test
-    void sync_propagatesException() {
-        doThrow(new RuntimeException("sync failed")).when(keyStoreSyncService).syncKeyStoresToFilesystem();
-
-        assertThrows(RuntimeException.class, () -> certificateManagerService.sync());
     }
 
     @Test
