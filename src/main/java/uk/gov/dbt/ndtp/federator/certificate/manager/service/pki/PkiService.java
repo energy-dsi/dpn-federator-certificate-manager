@@ -13,8 +13,11 @@ import java.security.PrivateKey;
 import java.time.Instant;
 import java.util.UUID;
 import lombok.extern.slf4j.Slf4j;
+import org.bouncycastle.asn1.ASN1ObjectIdentifier;
 import org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers;
 import org.bouncycastle.asn1.x500.X500Name;
+import org.bouncycastle.asn1.x500.X500NameBuilder;
+import org.bouncycastle.asn1.x500.style.BCStyle;
 import org.bouncycastle.asn1.x509.Extension;
 import org.bouncycastle.asn1.x509.Extensions;
 import org.bouncycastle.asn1.x509.GeneralName;
@@ -89,16 +92,17 @@ public class PkiService {
             PrivateKey privateKey = PemUtil.parsePkcs8PrivateKey(privateKeyPem);
             var publicKey = PemUtil.parsePublicKey(publicKeyPem);
 
-            // Build subject including State (ST) and Locality (L)
-            String subject = String.format(
-                    "C=%s, ST=%s, L=%s, O=%s, OU=%s, CN=%s",
-                    safe(req.getCountry()),
-                    safe(req.getState()),
-                    safe(req.getLocality()),
-                    safe(req.getOrganization()),
-                    safe(req.getOrganizationalUnit()),
-                    safe(req.getCommonName()));
-            X500Name x500 = new X500Name(subject);
+            // Build subject including State (ST) and Locality (L). Components the caller did not
+            // supply are omitted entirely: an RDN with an empty value is rejected by BouncyCastle's
+            // X.520 validation (e.g. C= must be exactly two characters).
+            X500NameBuilder subject = new X500NameBuilder(BCStyle.INSTANCE);
+            addRdn(subject, BCStyle.C, req.getCountry());
+            addRdn(subject, BCStyle.ST, req.getState());
+            addRdn(subject, BCStyle.L, req.getLocality());
+            addRdn(subject, BCStyle.O, req.getOrganization());
+            addRdn(subject, BCStyle.OU, req.getOrganizationalUnit());
+            addRdn(subject, BCStyle.CN, req.getCommonName());
+            X500Name x500 = subject.build();
 
             // CSR builder
             JcaPKCS10CertificationRequestBuilder csrBuilder = new JcaPKCS10CertificationRequestBuilder(x500, publicKey);
@@ -125,6 +129,19 @@ public class PkiService {
         } catch (Exception e) {
             log.error("Failed to create CSR for subject common name: {}", req.getCommonName(), e);
             throw new PkiException("CSR creation failed", e);
+        }
+    }
+
+    /**
+     * Adds a subject component to the DN, skipping it when the caller supplied no value.
+     *
+     * @param builder the subject DN being assembled
+     * @param oid the attribute to add
+     * @param value the attribute value; ignored if null or blank
+     */
+    private static void addRdn(X500NameBuilder builder, ASN1ObjectIdentifier oid, String value) {
+        if (value != null && !value.isBlank()) {
+            builder.addRDN(oid, safe(value));
         }
     }
 
