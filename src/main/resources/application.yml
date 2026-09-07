@@ -21,6 +21,17 @@ spring:
       ssl:
         trust-store: ${VAULT_SSL_TRUST_STORE:}
         trust-store-password: ${VAULT_SSL_TRUST_STORE_PASSWORD:}
+  # Trust material for the OTLP Collector (see the "OpenTelemetry tracing/logging" comment below).
+  # Reuses the same private CA as Vault's truststore.jks; point OTEL_TRUSTSTORE_LOCATION/PASSWORD
+  # at a different trust store if the Collector's CA ever diverges from Vault's.
+  ssl:
+    bundle:
+      jks:
+        otel-collector:
+          truststore:
+            location: ${OTEL_TRUSTSTORE_LOCATION:classpath:truststore.jks}
+            password: ${OTEL_TRUSTSTORE_PASSWORD:changeit}
+            type: PKCS12
 
 
 application:
@@ -117,32 +128,51 @@ logging:
     io.github.resilience4j: ${LOG_LEVEL_RESILIENCE4J:DEBUG}
   pattern:
     # traceId/spanId added via Micrometer Tracing's MDC integration (populated automatically
-    # once management.tracing.enabled=true below - no code changes needed at log call sites).
+    # once management.tracing.export.enabled=true below - no code changes needed at log call sites).
     # Existing clientId MDC field is preserved exactly as before.
     console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} [%X{clientId}] [traceId=%X{traceId:-}] [spanId=%X{spanId:-}] - %msg%n"
     file: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} [%X{clientId}] [traceId=%X{traceId:-}] [spanId=%X{spanId:-}] - %msg%n"
 
-# OpenTelemetry tracing - Micrometer Tracing bridged to OTel, exported via OTLP to a Collector.
-# management.otlp.tracing.endpoint uses Spring Boot's OtlpHttpSpanExporter (HTTP transport,
-# port 4318, path /v1/traces) - this is a DIFFERENT transport/port than the federator-gateway
-# project's gRPC OTLP exporter (port 4317), and the two are not interchangeable here.
+# OpenTelemetry tracing/logging - both exported via OTLP/HTTP (port 4318) to a Collector, using
+# Spring Boot 4.1's native management.opentelemetry.* autoconfiguration (spring-boot-opentelemetry
+# / spring-boot-micrometer-tracing-opentelemetry in pom.xml). This is a DIFFERENT transport/port
+# than the federator-gateway project's gRPC OTLP exporter (port 4317) - the two are not
+# interchangeable here.
 # All endpoints/sampling are externally configurable so dev/AKS values can differ from local
-# without code changes. No value here disables anything if the Collector is unreachable:
-# Micrometer's OTLP span exporter logs export failures but never blocks application startup
-# or scheduled job execution.
+# without code changes. No value here disables anything if the Collector is unreachable: the
+# OTLP exporters log export failures but never block application startup or scheduled job
+# execution.
+#
+# TLS: the Collector is reached over https and presents a certificate signed by the same private
+# CA as Vault (docker/vault-https/ca/rootCA.crt), so both otlp.*.ssl.bundle entries below point at
+# the "otel-collector" bundle defined under spring.ssl.bundle.jks above (same truststore.jks as
+# Vault).
 management:
   tracing:
-    enabled: ${OTEL_TRACES_ENABLED:true}
+    export:
+      enabled: ${OTEL_TRACES_ENABLED:true}
     sampling:
       probability: ${OTEL_TRACES_SAMPLER_ARG:1.0}
-  otlp:
+  opentelemetry:
+    resource-attributes:
+      # component.name mirrors service.name below so the health-monitoring Data Prepper (which
+      # scans resource.attributes for component.name) groups this service under one component.
+      component.name: ${OTEL_SERVICE_NAME:certificate-manager}
     tracing:
-      endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4318}/v1/traces
+      export:
+        otlp:
+          endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:https://localhost:4318}/v1/traces
+          ssl:
+            bundle: otel-collector
+    logging:
+      export:
+        otlp:
+          endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:https://localhost:4318}/v1/logs
+          ssl:
+            bundle: otel-collector
   observations:
     key-values:
       service.name: ${OTEL_SERVICE_NAME:certificate-manager}
 otel:
-  logs:
-    endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4318}/v1/logs
   heartbeat:
     interval-seconds: ${OTEL_HEARTBEAT_INTERVAL_SECONDS:900}
