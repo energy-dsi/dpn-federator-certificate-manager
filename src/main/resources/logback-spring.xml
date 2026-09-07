@@ -36,9 +36,11 @@
         </encoder>
     </appender>
 
-    <!-- Exports log records to the OTLP Collector. The OpenTelemetry SDK/exporter is wired to
-         this appender at runtime by OpenTelemetryLogsConfig via OpenTelemetryAppender.install();
-         until that call runs the appender has no SDK and drops logs, so both must be present.
+    <!-- Exports log records to the OTLP Collector. Spring Boot 4.1's native OpenTelemetry
+         autoconfiguration (management.opentelemetry.logging.export.otlp.* in application.yml)
+         builds the SDK/exporter; OpenTelemetryLogsConfig wires it to this appender at runtime via
+         OpenTelemetryAppender.install() - until that call runs the appender has no SDK and drops
+         logs, so both must be present.
          trace_id/span_id are attached automatically from the active span; captureMdcAttributes
          additionally carries this project's custom clientId MDC field onto the exported record.
          captureKeyValuePairAttributes carries SLF4J 2.x addKeyValue(...) pairs onto the record -
