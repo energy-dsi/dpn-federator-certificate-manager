@@ -30,7 +30,7 @@ spring:
         otel-collector:
           truststore:
             location: ${OTEL_TRUSTSTORE_LOCATION:classpath:truststore.jks}
-            password: ${OTEL_TRUSTSTORE_PASSWORD:changeit}
+            password: ${OTEL_TRUSTSTORE_PASSWORD:}
             type: PKCS12
 
 
