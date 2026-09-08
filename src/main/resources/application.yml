@@ -23,7 +23,10 @@ spring:
         trust-store-password: ${VAULT_SSL_TRUST_STORE_PASSWORD:}
   # Trust material for the OTLP Collector (see the "OpenTelemetry tracing/logging" comment below).
   # Reuses the same private CA as Vault's truststore.jks; point OTEL_TRUSTSTORE_LOCATION/PASSWORD
-  # at a different trust store if the Collector's CA ever diverges from Vault's.
+  # at a different trust store if the Collector's CA ever diverges from Vault's. No hardcoded
+  # password default (matches spring.cloud.vault.ssl.trust-store-password above) - supply
+  # OTEL_TRUSTSTORE_PASSWORD via the real deployment's secret store; local dev profiles set it
+  # directly since those files aren't committed.
   ssl:
     bundle:
       jks:

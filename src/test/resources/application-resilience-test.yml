@@ -6,6 +6,14 @@ spring:
   cloud:
     vault:
       enabled: false
+  # application.yml has no password default for the OTel bundle (see its comment); this test
+  # profile supplies a throwaway value so the context can still load the SSL bundle.
+  ssl:
+    bundle:
+      jks:
+        otel-collector:
+          truststore:
+            password: changeit
 
 resilience4j:
   retry:
