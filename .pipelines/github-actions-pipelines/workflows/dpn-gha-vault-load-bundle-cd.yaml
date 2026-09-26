@@ -1,0 +1,318 @@
+name: DPN CD - Vault Load Cert Bundle
+
+# =============================================================================
+# Load Cert Bundle into Vault — DPN Platform   (PART 2 of 2)
+#
+# GitHub Actions parity for the ADO 'vault-load-bundle-cd' pipeline.
+# Loads the DSM-signed client certificate bundle into the certificate-manager
+# KV paths in a running Vault, so certificate-manager can build its initial
+# keystore/truststore and self-enrol.
+#
+# ADO sourced the bundle from Library > Secure Files. GitHub has no Secure Files,
+# so the three files are provided as Actions secrets whose VALUE is the exact
+# file content (GitHub secret names can't contain '.'/'-', so underscores):
+#   VAULT_KEY         <- contents of vault.key        (private key)
+#   CERTIFICATE_PEM   <- contents of certificate.pem  (signed cert)
+#   CA_CHAIN_PEM      <- contents of ca-chain.pem     (CA chain)
+#     e.g.  gh secret set VAULT_KEY --env <env>-<cluster> < vault.key
+#
+# The Vault root token is read at runtime from the cloud secrets backend
+# (VAULT-TOKEN on Azure Key Vault, dpn/<environment>-<cluster>/vault-https/VAULT_TOKEN
+# on AWS Secrets Manager) — the same object dpn-vault-https-cd (VaultInit) stores
+# it under. Never hardcoded.
+#
+# Prerequisites:
+#   1. vault-https deployed + unsealed in the target cluster.
+#   2. Root token in the secrets backend as 'VAULT-TOKEN' (Azure) or
+#      dpn/<environment>-<cluster>/vault-https/VAULT_TOKEN (AWS).
+#   3. KV v2 enabled at 'pki-client'.
+#   4. The three bundle Actions secrets set for this environment.
+#
+# Writes (read back by certificate-manager via VaultSecretProvider):
+#   pki-client/node-net/client/{keypair,certificate,ca-chain}
+#
+# GCP is a future plan — not yet implemented.
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Select Environment"
+        required: true
+        default: "test"
+        type: choice
+        options:
+          - dev
+          - test
+
+      cluster:
+        description: "Target DPN Cluster"
+        required: true
+        default: "dpn01"
+        type: choice
+        options:
+          - dpn01
+          - dpn02
+
+      cloud:
+        description: "Target Cloud Provider"
+        required: true
+        default: "aws"
+        type: choice
+        options:
+          - azure
+          - aws
+          - gcp
+
+env:
+  PARAMETERS_FILE: .github/config/${{ inputs.cloud }}/${{ inputs.environment }}-${{ inputs.cluster }}.json
+  LOAD_SCRIPT: dpn-federator-cert-manager/scripts/load-bootstrap-bundle.sh
+  VAULT_FULL_NAME: dpn-vault-https
+  VAULT_TOKEN_SECRET_NAME: VAULT-TOKEN
+  KV_MOUNT: pki-client
+  KV_BASE: node-net/client
+  HUB_ROLE_ARN: <<your specific value>>
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  load-bundle:
+    name: Load cert bundle into Vault
+    runs-on: [self-hosted, vmss]
+    environment: ${{ inputs.environment }}-${{ inputs.cluster }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Applied Parameters
+        shell: bash
+        run: |
+          echo "environment=${{ inputs.environment }}"
+          echo "cluster=${{ inputs.cluster }}"
+          echo "cloud=${{ inputs.cloud }}"
+
+      - name: Read Deployment Config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "${PARAMETERS_FILE}" ]; then
+            echo "ERROR: ${PARAMETERS_FILE} not found!"
+            exit 1
+          fi
+
+          echo "Loading config from ${PARAMETERS_FILE}"
+          for key in $(jq -r 'keys_unsorted[]' "${PARAMETERS_FILE}"); do
+            value=$(jq -r ".\"$key\"" "${PARAMETERS_FILE}")
+            echo "${key}=${value}" >> "$GITHUB_ENV"
+            echo "Set ${key}"
+          done
+
+      - name: Validate Bundle Secrets
+        shell: bash
+        env:
+          VAULT_KEY: ${{ secrets.VAULT_KEY }}
+          CERTIFICATE_PEM: ${{ secrets.CERTIFICATE_PEM }}
+          CA_CHAIN_PEM: ${{ secrets.CA_CHAIN_PEM }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in VAULT_KEY CERTIFICATE_PEM CA_CHAIN_PEM; do
+            eval "val=\${$name:-}"
+            if [ -z "${val:-}" ]; then
+              echo "::error::Missing Actions secret for $name"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          echo "All three bundle secrets are present."
+
+      - name: Cloud Login
+        uses: ./.github/actions/cloud-login
+        with:
+          cloud: ${{ inputs.cloud }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          aws-region: ${{ env.AWS_REGION }}
+          aws-account-id: ${{ env.AWS_ACCOUNT_ID }}
+          eks-cluster: ${{ env.EKS_CLUSTER }}
+
+      - name: EKS Context
+        if: ${{ inputs.cloud == 'aws' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER"
+
+          if ! timeout 30 kubectl get ns >/dev/null; then
+            echo "::error::Could not reach the EKS API server for $EKS_CLUSTER within 30s."
+            echo "::error::This is almost always a network-reachability issue (runner not routed to this cluster's VPC), not a workflow bug."
+
+            echo "::group::DEBUG - cluster describe"
+            aws eks describe-cluster --region "$AWS_REGION" --name "$EKS_CLUSTER" \
+              --query "cluster.{status:status,endpoint:endpoint,endpointPublicAccess:resourcesVpcConfig.endpointPublicAccess,endpointPrivateAccess:resourcesVpcConfig.endpointPrivateAccess,publicAccessCidrs:resourcesVpcConfig.publicAccessCidrs,vpcId:resourcesVpcConfig.vpcId}" || true
+            echo "::endgroup::"
+
+            exit 1
+          fi
+          echo "EKS context ready"
+
+      ###################################################################
+      # RESOLVE VAULT POD (cloud-agnostic)
+      ###################################################################
+      - name: Resolve Vault Pod
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          POD=$(kubectl get pod -n "$NAMESPACE" -l app="$VAULT_FULL_NAME" \
+            -o jsonpath='{.items[0].metadata.name}')
+          if [ -z "$POD" ]; then
+            echo "::error::No vault pod found (app=$VAULT_FULL_NAME) in namespace $NAMESPACE."
+            echo "::error::vault-https must be deployed before running load-bundle."
+            echo "::group::DEBUG - pods in namespace"
+            kubectl get pods -n "$NAMESPACE" -o wide || true
+            echo "::endgroup::"
+            exit 1
+          fi
+          echo "VAULT_POD=$POD" >> "$GITHUB_ENV"
+          echo "Using vault pod: $POD"
+
+      - name: Fetch Root Token from Key Vault
+        if: ${{ inputs.cloud == 'azure' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VAULT_TOKEN=$(az keyvault secret show \
+            --vault-name "$KEY_VAULT_NAME" \
+            --name "$VAULT_TOKEN_SECRET_NAME" \
+            --query "value" -o tsv 2>/dev/null || true)
+
+          if [ -z "$VAULT_TOKEN" ]; then
+            echo "::error::$VAULT_TOKEN_SECRET_NAME not found in Key Vault $KEY_VAULT_NAME."
+            echo "::error::Run dpn-vault-https-cd (VaultInit, storeRootTokenInSecretsBackend=true) first."
+            exit 1
+          fi
+          # Mask and stash for later steps
+          echo "::add-mask::$VAULT_TOKEN"
+          echo "VAULT_TOKEN=$VAULT_TOKEN" >> "$GITHUB_ENV"
+          echo "Root token retrieved from Key Vault."
+
+      - name: AppRole Login (AWS)
+        if: ${{ inputs.cloud == 'aws' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # certificate-manager's AppRole policy already grants create/read/update/list
+          # on pki-client/data/node-net/client/* (the exact path this pipeline writes
+          # to), so we authenticate as that AppRole instead of using Vault's root
+          # token. role_id is not sensitive; secret_id is fetched from Secrets Manager
+          # (published by dpn-certificate-manager-role-id-creation.yml).
+          ROLE_ID_SECRET="dpn/${{ inputs.environment }}-${{ inputs.cluster }}/certificate-manager/VAULT_APPROLE_ROLE_ID"
+          SECRET_ID_SECRET="dpn/${{ inputs.environment }}-${{ inputs.cluster }}/certificate-manager/VAULT_APPROLE_SECRET_ID"
+
+          ROLE_ID=$(aws secretsmanager get-secret-value \
+            --secret-id "$ROLE_ID_SECRET" \
+            --query "SecretString" --output text 2>/dev/null || true)
+          SECRET_ID=$(aws secretsmanager get-secret-value \
+            --secret-id "$SECRET_ID_SECRET" \
+            --query "SecretString" --output text 2>/dev/null || true)
+
+          if [ -z "$ROLE_ID" ] || [ -z "$SECRET_ID" ]; then
+            echo "::error::AppRole role_id/secret_id not found in Secrets Manager ($ROLE_ID_SECRET / $SECRET_ID_SECRET)."
+            echo "::error::Run dpn-certificate-manager-role-id-creation.yml first."
+            exit 1
+          fi
+          echo "::add-mask::$SECRET_ID"
+
+          VAULT_TOKEN=$(kubectl exec -n "$NAMESPACE" "$VAULT_POD" -- sh -c "
+            VAULT_ADDR=https://127.0.0.1:8200 VAULT_SKIP_VERIFY=true \
+            vault write -field=token auth/approle/login role_id='$ROLE_ID' secret_id='$SECRET_ID'
+          " 2>/dev/null || true)
+
+          if [ -z "$VAULT_TOKEN" ]; then
+            echo "::error::AppRole login failed — could not obtain a Vault token."
+            exit 1
+          fi
+          echo "::add-mask::$VAULT_TOKEN"
+          echo "VAULT_TOKEN=$VAULT_TOKEN" >> "$GITHUB_ENV"
+          echo "Vault token obtained via certificate-manager AppRole login."
+
+      - name: Write Bundle to Files
+        shell: bash
+        env:
+          VAULT_KEY: ${{ secrets.VAULT_KEY }}
+          CERTIFICATE_PEM: ${{ secrets.CERTIFICATE_PEM }}
+          CA_CHAIN_PEM: ${{ secrets.CA_CHAIN_PEM }}
+        run: |
+          set -euo pipefail
+
+          BUNDLE_DIR="${RUNNER_TEMP}/vault-bundle"
+          mkdir -p "$BUNDLE_DIR"
+          echo "BUNDLE_DIR=${BUNDLE_DIR}" >> "$GITHUB_ENV"
+
+          # Secret values are the raw PEM file contents — write them out verbatim.
+          printf '%s\n' "$VAULT_KEY"       > "$BUNDLE_DIR/vault.key"
+          printf '%s\n' "$CERTIFICATE_PEM" > "$BUNDLE_DIR/certificate.pem"
+          printf '%s\n' "$CA_CHAIN_PEM"    > "$BUNDLE_DIR/ca-chain.pem"
+
+          # Derive the public key here (the Vault container has no openssl); the
+          # keypair KV entry stores both privateKey and publicKey (per DSI docs).
+          openssl rsa -in "$BUNDLE_DIR/vault.key" -pubout > "$BUNDLE_DIR/vault.pub"
+
+          for f in vault.key vault.pub certificate.pem ca-chain.pem; do
+            [ -s "$BUNDLE_DIR/$f" ] || { echo "::error::$f is empty"; exit 1; }
+          done
+          echo "Bundle written to $BUNDLE_DIR"
+
+      - name: Copy Bundle + Script into Vault Pod
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl cp "$BUNDLE_DIR/vault.key"       "$NAMESPACE/$VAULT_POD:/tmp/vault.key"
+          kubectl cp "$BUNDLE_DIR/vault.pub"       "$NAMESPACE/$VAULT_POD:/tmp/vault.pub"
+          kubectl cp "$BUNDLE_DIR/certificate.pem" "$NAMESPACE/$VAULT_POD:/tmp/certificate.pem"
+          kubectl cp "$BUNDLE_DIR/ca-chain.pem"    "$NAMESPACE/$VAULT_POD:/tmp/ca-chain.pem"
+          kubectl cp "$LOAD_SCRIPT"                "$NAMESPACE/$VAULT_POD:/tmp/load-bootstrap-bundle.sh"
+
+      - name: Load Bundle into Vault
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! kubectl exec -n "$NAMESPACE" "$VAULT_POD" -- sh -c "
+            tr -d '\r' < /tmp/load-bootstrap-bundle.sh > /tmp/lbb.sh &&
+            KEY_FILE='/tmp/vault.key' PUB_FILE='/tmp/vault.pub' KV_MOUNT='$KV_MOUNT' KV_BASE='$KV_BASE' VAULT_TOKEN='$VAULT_TOKEN' sh /tmp/lbb.sh
+          "; then
+            echo "::error::Failed to load the cert bundle into Vault (pod: $VAULT_POD)."
+            echo "::error::Common causes: Vault sealed, invalid/expired root token, KV v2 not enabled at $KV_MOUNT."
+
+            echo "::group::DEBUG - vault status"
+            kubectl exec -n "$NAMESPACE" "$VAULT_POD" -- \
+              sh -c 'VAULT_ADDR=https://127.0.0.1:8200 VAULT_SKIP_VERIFY=true vault status || true'
+            echo "::endgroup::"
+
+            exit 1
+          fi
+
+      - name: Cleanup Pod Temp Files
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${VAULT_POD:-}" ]; then
+            kubectl exec -n "$NAMESPACE" "$VAULT_POD" -- sh -c "
+              rm -f /tmp/vault.key /tmp/vault.pub /tmp/certificate.pem /tmp/ca-chain.pem \
+                    /tmp/lbb.sh /tmp/load-bootstrap-bundle.sh
+            " || true
+          fi
+          echo "Bootstrap bundle load complete."

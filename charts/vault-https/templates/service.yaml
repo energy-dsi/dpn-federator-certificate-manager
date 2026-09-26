@@ -1,0 +1,69 @@
+{{- $name := .Values.fullnameOverride | default .Release.Name }}
+# ClusterIP — in-cluster access
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ $name }}
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  type: ClusterIP
+  selector:
+    app: {{ $name }}
+  ports:
+    - name: https
+      port: 8200
+      targetPort: 8200
+      protocol: TCP
+
+{{- if .Values.service.aliasEnabled }}
+---
+# Alias Service — matches TLS cert SAN: vault-https.ns-dpn-01.svc.cluster.local
+apiVersion: v1
+kind: Service
+metadata:
+  name: vault-https
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ $name }}
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  type: ClusterIP
+  selector:
+    app: {{ $name }}
+  ports:
+    - name: https
+      port: 8200
+      targetPort: 8200
+      protocol: TCP
+{{- end }}
+
+{{- if .Values.service.lb.enabled }}
+---
+# Internal Azure Load Balancer — VNet access only
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-lb
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ $name }}
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  annotations:
+    {{- toYaml .Values.service.lb.annotations | nindent 4 }}
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: {{ .Values.service.lb.externalTrafficPolicy }}
+  selector:
+    app: {{ $name }}
+  ports:
+    - name: https
+      port: 8200
+      targetPort: 8200
+      protocol: TCP
+{{- end }}

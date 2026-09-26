@@ -1,0 +1,350 @@
+name: DPN CD - Vault HTTPS
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Select Environment"
+        required: true
+        default: "test"
+        type: choice
+        options:
+          - dev
+          - test
+
+      cluster:
+        description: "Target DPN Cluster"
+        required: true
+        default: "dpn01"
+        type: choice
+        options:
+          - dpn01
+          - dpn02
+
+      cloud:
+        description: "Target Cloud Provider"
+        required: true
+        default: "aws"
+        type: choice
+        options:
+          - azure
+          - aws
+          - gcp
+
+      vaultImageTag:
+        description: "Vault image tag (e.g. 1.16)"
+        required: true
+        default: "1.16"
+        type: string
+
+      vaultImageRepository:
+        description: "Vault image path AFTER <<your specific value>>/ (e.g. 1.0.1/vault) — leave blank to use the environment's configured repository"
+        required: false
+        default: ""
+        type: string
+
+      runVaultInit:
+        description: "Run Vault Init? (enables KV v2 + audit logs — safe to run on existing vaults)"
+        required: true
+        default: true
+        type: boolean
+
+      storeRootTokenInSecretsBackend:
+        description: "Store Vault root token in the cloud secrets backend (as VAULT-TOKEN / VAULT_TOKEN)?"
+        required: true
+        default: false
+        type: boolean
+
+env:
+  PARAMETERS_FILE: .github/config/${{ inputs.cloud }}/${{ inputs.environment }}-${{ inputs.cluster }}.json
+  CHART_DIR: dpn-federator-cert-manager/charts/vault-https
+  RELEASE_NAME: vault-https
+  VALUES_FILE: dpn-federator-cert-manager/charts/vault-https/values/${{ inputs.cloud }}/${{ inputs.environment }}-${{ inputs.cluster }}.yaml
+  VAULT_FULL_NAME: dpn-vault-https
+  VAULT_INIT_SCRIPT: dpn-federator-cert-manager/scripts/vault-init.sh
+  VAULT_TOKEN_SECRET_NAME: VAULT-TOKEN
+  KV_MOUNT: pki-client
+  HUB_ROLE_ARN: <<your specific value>>
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Helm Deploy
+    runs-on: [self-hosted, vmss]
+    environment: ${{ inputs.environment }}-${{ inputs.cluster }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Applied Parameters
+        shell: bash
+        run: |
+          echo "environment=${{ inputs.environment }}"
+          echo "cluster=${{ inputs.cluster }}"
+          echo "cloud=${{ inputs.cloud }}"
+          echo "vaultImageTag=${{ inputs.vaultImageTag }}"
+          echo "vaultImageRepository=${{ inputs.vaultImageRepository }}"
+          echo "runVaultInit=${{ inputs.runVaultInit }}"
+          echo "storeRootTokenInSecretsBackend=${{ inputs.storeRootTokenInSecretsBackend }}"
+
+      - name: Read Deployment Config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "${PARAMETERS_FILE}" ]; then
+            echo "ERROR: ${PARAMETERS_FILE} not found!"
+            exit 1
+          fi
+
+          echo "Loading config from ${PARAMETERS_FILE}"
+          for key in $(jq -r 'keys_unsorted[]' "${PARAMETERS_FILE}"); do
+            value=$(jq -r ".\"$key\"" "${PARAMETERS_FILE}")
+            echo "${key}=${value}" >> "$GITHUB_ENV"
+            echo "Set ${key}"
+          done
+
+      - name: Cloud Login
+        uses: ./.github/actions/cloud-login
+        with:
+          cloud: ${{ inputs.cloud }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          aws-region: ${{ env.AWS_REGION }}
+          aws-account-id: ${{ env.AWS_ACCOUNT_ID }}
+          eks-cluster: ${{ env.EKS_CLUSTER }}
+
+      - name: EKS Context
+        if: ${{ inputs.cloud == 'aws' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER"
+
+          if ! timeout 30 kubectl get ns >/dev/null; then
+            echo "::error::Could not reach the EKS API server for $EKS_CLUSTER within 30s."
+            echo "::error::This is almost always a network-reachability issue (runner not routed to this cluster's VPC), not a workflow bug."
+
+            echo "::group::DEBUG - cluster describe"
+            aws eks describe-cluster --region "$AWS_REGION" --name "$EKS_CLUSTER" \
+              --query "cluster.{status:status,endpoint:endpoint,endpointPublicAccess:resourcesVpcConfig.endpointPublicAccess,endpointPrivateAccess:resourcesVpcConfig.endpointPrivateAccess,publicAccessCidrs:resourcesVpcConfig.publicAccessCidrs,vpcId:resourcesVpcConfig.vpcId}" || true
+            echo "::endgroup::"
+
+            exit 1
+          fi
+          echo "EKS context ready"
+
+      ###################################################################
+      # HELM LINT + DRY RUN
+      ###################################################################
+      - name: Helm Lint + Dry Run
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXTRA_ARGS=()
+          if [ -n "${{ inputs.vaultImageRepository }}" ]; then
+            EXTRA_ARGS+=(--set image.repository="<<your specific value>>/${{ inputs.vaultImageRepository }}")
+          fi
+
+          helm lint "$CHART_DIR" -f "$VALUES_FILE" \
+            --set image.tag="${{ inputs.vaultImageTag }}" \
+            "${EXTRA_ARGS[@]}"
+
+          helm upgrade --install "$RELEASE_NAME" "$CHART_DIR" \
+            --namespace "$NAMESPACE" \
+            --create-namespace \
+            -f "$VALUES_FILE" \
+            --set image.tag="${{ inputs.vaultImageTag }}" \
+            "${EXTRA_ARGS[@]}" \
+            --dry-run
+
+          echo "Validation passed"
+
+      ###################################################################
+      # HELM DEPLOY
+      ###################################################################
+      - name: Helm Deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # NOTE: no --wait/--timeout here. On this runner, long-lived watches
+          # against the EKS API (which is what `helm --wait` relies on) are
+          # unreliable and time out ("context deadline exceeded") even when the
+          # underlying rollout completes successfully on the cluster (confirmed
+          # via a direct `kubectl rollout status` from a session with a stable
+          # connection to the cluster, which returns instantly). Short-lived
+          # calls (plain kubectl commands, each its own connection) are fine.
+          # So: fire the upgrade without waiting, then poll readiness with a
+          # short per-attempt timeout and a few retries instead.
+          EXTRA_ARGS=()
+          if [ -n "${{ inputs.vaultImageRepository }}" ]; then
+            EXTRA_ARGS+=(--set image.repository="<<your specific value>>/${{ inputs.vaultImageRepository }}")
+          fi
+
+          if ! helm upgrade --install "$RELEASE_NAME" "$CHART_DIR" \
+            --namespace "$NAMESPACE" \
+            -f "$VALUES_FILE" \
+            --set image.tag="${{ inputs.vaultImageTag }}" \
+            "${EXTRA_ARGS[@]}"; then
+            echo "::error::Helm Deploy (helm upgrade --install) failed."
+
+            echo "::group::DEBUG - helm status"
+            helm status "$RELEASE_NAME" -n "$NAMESPACE" || true
+            echo "::endgroup::"
+
+            exit 1
+          fi
+
+          echo "Helm upgrade call succeeded — polling rollout status separately..."
+
+          ROLLOUT_OK=false
+          for attempt in 1 2 3 4 5; do
+            if kubectl rollout status "deployment/$VAULT_FULL_NAME" -n "$NAMESPACE" --timeout=60s; then
+              ROLLOUT_OK=true
+              break
+            fi
+            echo "Rollout status attempt $attempt/5 did not complete within 60s — retrying..."
+            sleep 10
+          done
+
+          if [ "$ROLLOUT_OK" != "true" ]; then
+            echo "::error::Deployment $VAULT_FULL_NAME did not report ready after 5 attempts."
+
+            echo "::group::DEBUG - helm status"
+            helm status "$RELEASE_NAME" -n "$NAMESPACE" || true
+            echo "::endgroup::"
+
+            echo "::group::DEBUG - pods (wide)"
+            kubectl get pods -n "$NAMESPACE" -l app="$VAULT_FULL_NAME" -o wide || true
+            echo "::endgroup::"
+
+            echo "::group::DEBUG - pod describe (events, scheduling, mounts)"
+            kubectl describe pods -n "$NAMESPACE" -l app="$VAULT_FULL_NAME" || true
+            echo "::endgroup::"
+
+            echo "::group::DEBUG - PVCs"
+            kubectl get pvc -n "$NAMESPACE" || true
+            kubectl describe pvc -n "$NAMESPACE" -l app="$VAULT_FULL_NAME" || true
+            echo "::endgroup::"
+
+            echo "::group::DEBUG - SecretProviderClass"
+            kubectl get secretproviderclass -n "$NAMESPACE" || true
+            kubectl describe secretproviderclass -n "$NAMESPACE" "$VAULT_FULL_NAME-kv-secrets" || true
+            echo "::endgroup::"
+
+            echo "::group::DEBUG - namespace events (most recent 50)"
+            kubectl get events -n "$NAMESPACE" --sort-by='.lastTimestamp' | tail -n 50 || true
+            echo "::endgroup::"
+
+            exit 1
+          fi
+
+          echo "========================================"
+          echo "POST-DEPLOY STATUS"
+          echo "========================================"
+          kubectl get pods -n "$NAMESPACE" -l app="$VAULT_FULL_NAME" -o wide
+          kubectl get svc -n "$NAMESPACE" -l app="$VAULT_FULL_NAME"
+
+      ###################################################################
+      # POST-DEPLOY VERIFICATION
+      ###################################################################
+      - name: Vault HTTPS Seal Status Check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VAULT_POD=$(kubectl get pod -n "$NAMESPACE" -l app="$VAULT_FULL_NAME" \
+            -o jsonpath='{.items[0].metadata.name}')
+
+          echo "Pod: $VAULT_POD"
+          kubectl exec -n "$NAMESPACE" "$VAULT_POD" -- \
+            sh -c 'VAULT_ADDR=https://127.0.0.1:8200 VAULT_SKIP_VERIFY=true vault status || true'
+
+      ###################################################################
+      # VAULT INIT (opt-in) — enable KV v2 + audit, optionally store root token
+      ###################################################################
+      - name: Vault Init
+        if: ${{ inputs.runVaultInit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          INIT_FILE="${RUNNER_TEMP}/vault-init.txt"
+          echo "INIT_FILE=${INIT_FILE}" >> "$GITHUB_ENV"
+
+          chmod +x "$VAULT_INIT_SCRIPT"
+          NAMESPACE="$NAMESPACE" \
+          VAULT_POD_LABEL="app=$VAULT_FULL_NAME" \
+          KV_MOUNT="$KV_MOUNT" \
+          CLOUD="${{ inputs.cloud }}" \
+          AKV_NAME="${KEY_VAULT_NAME:-}" \
+          SECRET_NAME="$VAULT_TOKEN_SECRET_NAME" \
+          AWS_SECRET_NAME="dpn/${{ inputs.environment }}-${{ inputs.cluster }}/vault-https/VAULT_TOKEN" \
+          STORE_ROOT_TOKEN="${{ inputs.storeRootTokenInSecretsBackend }}" \
+          INIT_FILE="$INIT_FILE" \
+          bash "$VAULT_INIT_SCRIPT"
+
+      - name: Ensure Init File Exists
+        if: ${{ always() && inputs.runVaultInit }}
+        shell: bash
+        run: |
+          if [ ! -f "${INIT_FILE:-}" ]; then
+            echo "Vault was already initialised — no init file generated on this run." \
+              > "${INIT_FILE:-${RUNNER_TEMP}/vault-init.txt}"
+            echo "INIT_FILE=${INIT_FILE:-${RUNNER_TEMP}/vault-init.txt}" >> "$GITHUB_ENV"
+          fi
+
+      # WARNING: this artifact can contain the Vault root token + recovery keys.
+      # Download it, store the material in a secure vault, then delete the artifact.
+      - name: Publish Init File (root token + recovery keys)
+        if: ${{ always() && inputs.runVaultInit }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vault-init-output-${{ inputs.environment }}-${{ inputs.cluster }}
+          path: ${{ env.INIT_FILE }}
+          retention-days: 1
+
+      ###################################################################
+      # CAPTURE DEPLOYED IMAGE DIGEST
+      ###################################################################
+      - name: Capture Deployed Image Digest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VAULT_DIGEST=$(kubectl get pods -n "$NAMESPACE" \
+            -l app="$VAULT_FULL_NAME" \
+            -o jsonpath='{.items[0].status.containerStatuses[0].imageID}')
+
+          if [ -z "$VAULT_DIGEST" ]; then
+            echo "::error::Could not resolve deployed vault-https image digest from pod status"
+            exit 1
+          fi
+
+          echo "Vault HTTPS image digest: $VAULT_DIGEST"
+
+          mkdir -p "$GITHUB_WORKSPACE/deployed-digest"
+
+          {
+            echo "$VAULT_DIGEST"
+            echo "component=vault-https"
+            echo "environment=${{ inputs.environment }}"
+            echo "dpncluster=${{ inputs.cluster }}"
+            echo "imageTag=${{ inputs.vaultImageTag }}"
+          } > "$GITHUB_WORKSPACE/deployed-digest/vault-https-digest.txt"
+
+          echo "Digest written to $GITHUB_WORKSPACE/deployed-digest"
+
+      - name: Publish Deployed Image Digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployed-image-digest
+          path: deployed-digest/

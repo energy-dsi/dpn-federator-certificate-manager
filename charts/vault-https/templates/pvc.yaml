@@ -1,0 +1,16 @@
+{{- $name := .Values.fullnameOverride | default .Release.Name }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}-data
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ $name }}
+    app.kubernetes.io/name: {{ $name }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size }}
+  storageClassName: {{ .Values.persistence.storageClassName }}

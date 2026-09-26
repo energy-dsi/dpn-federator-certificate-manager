@@ -1,0 +1,391 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ~ SPDX-License-Identifier: Apache-2.0
+  ~ © Crown Copyright 2026. This work has been developed by the National Digital Twin Programme and is legally
+  ~ attributed to the Department for Business and Trade (UK) as the governing entity.
+  -->
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>4.1.1</version>
+    <relativePath/>
+  </parent>
+  <groupId>uk.gov.dbt.ndtp.ia.federator.certificate-manager</groupId>
+  <artifactId>federator-certificate-manager</artifactId>
+  <version>0.90.5</version>
+  <packaging>jar</packaging>
+  <name>federator-certificate-manager</name>
+  <description>Provides Certificate lifecycle management for federator components</description>
+  <url>https://github.com/National-Node-Net/federator-certificate-manager</url>
+  <licenses>
+    <license>
+      <name>Apache-2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+      <distribution>repo</distribution>
+      <comments>A business-friendly OSS license</comments>
+    </license>
+  </licenses>
+
+  <developers>
+    <developer>
+      <name>IANodeDevelopers</name>
+      <email>NDTP@businessandtrade.gov.uk</email>
+      <organization>Department for Business and Trade</organization>
+      <organizationUrl>https://ndtp.co.uk</organizationUrl>
+    </developer>
+  </developers>
+  <scm>
+    <connection>scm:git:git@github.com:National-Node-Net/federator-certificate-manager.git</connection>
+    <developerConnection>scm:git:git@github.com:National-Node-Net/federator-certificate-manager.git</developerConnection>
+    <url>https://github.com/National-Node-Net/federator-certificate-manager</url>
+  </scm>
+  <properties>
+    <maven.compiler.release>21</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <spring-cloud.version>2025.1.3</spring-cloud.version>
+    <!-- Boot 4 splits classic Jackson 2.x (com.fasterxml.jackson) under jackson-2-bom.version;
+         jackson-bom.version now refers to Jackson 3 (tools.jackson), which this project does not
+         use directly - OtelJsonEncoder is the only direct Jackson consumer and stays on Jackson
+         2.x - but Boot's own default web/JSON stack still pulls tools.jackson.core:jackson-databind
+         in transitively, so its version still needs patching (CVE-2026-68497: 3.1.5 -> 3.1.6). -->
+    <jackson-2-bom.version>2.21.6</jackson-2-bom.version>
+    <jackson-bom.version>3.1.6</jackson-bom.version>
+    <plugin.spotless>2.46.1</plugin.spotless>
+    <plugin.spotless.gson>2.11.0</plugin.spotless.gson>
+    <plugin.spotless.palantir>2.73.0</plugin.spotless.palantir>
+    <plugin.cyclonedx>2.9.1</plugin.cyclonedx>
+    <jacoco-maven-plugin.version>0.8.13</jacoco-maven-plugin.version>
+    <modelmapper.version>3.2.0</modelmapper.version>
+    <mockito-junit-jupiter.version>5.10.0</mockito-junit-jupiter.version>
+    <bouncycastle.version>1.85</bouncycastle.version>
+    <tomcat.version>11.0.25</tomcat.version>
+    <otel.instrumentation.version>2.31.1-alpha</otel.instrumentation.version>
+    <spring-framework.version>7.0.9</spring-framework.version>
+    <spring-security.version>7.1.1</spring-security.version>
+    <commons-lang3.version>3.18.0</commons-lang3.version>
+    <logback.version>1.5.38</logback.version>
+  </properties>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework.cloud</groupId>
+        <artifactId>spring-cloud-dependencies</artifactId>
+        <version>${spring-cloud.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <!-- opentelemetry-bom and micrometer-bom are already imported by spring-boot-dependencies
+             (Boot 4.1.1 pins opentelemetry-bom 1.62.0 / micrometer-bom 1.17.1) - no need to
+             re-import and risk pinning a combination Boot hasn't tested together. Only the
+             instrumentation-bom-alpha (not managed by Boot) still needs an explicit import, for
+             the opentelemetry-logback-appender-1.0 dependency below. -->
+      <dependency>
+        <groupId>io.opentelemetry.instrumentation</groupId>
+        <artifactId>opentelemetry-instrumentation-bom-alpha</artifactId>
+        <version>${otel.instrumentation.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>org.modelmapper</groupId>
+      <artifactId>modelmapper</artifactId>
+      <version>${modelmapper.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-oauth2-client</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-security</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.cloud</groupId>
+      <artifactId>spring-cloud-starter-vault-config</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-cache</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.github.ben-manes.caffeine</groupId>
+      <artifactId>caffeine</artifactId>
+    </dependency>
+    <!-- Boot 4's auto-configured JSON stack defaults to Jackson 3 (tools.jackson); this project's
+         only direct Jackson user, OtelJsonEncoder, builds its own classic ObjectMapper and needs
+         com.fasterxml.jackson.core:jackson-databind (Jackson 2.x, see jackson-2-bom.version above)
+         on the classpath explicitly since it is no longer pulled in transitively. -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.httpcomponents.client5</groupId>
+      <artifactId>httpclient5</artifactId>
+    </dependency>
+    <!-- Not yet managed by spring-cloud-circuitbreaker-dependencies (which still only pins the
+         "spring-boot3" artifact name), so pinned explicitly at the same release resilience4j
+         publishes for both variants. -->
+    <dependency>
+      <groupId>io.github.resilience4j</groupId>
+      <artifactId>resilience4j-spring-boot4</artifactId>
+      <version>2.4.0</version>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-aspectj</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.bouncycastle</groupId>
+      <artifactId>bcpkix-jdk18on</artifactId>
+      <version>${bouncycastle.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.bouncycastle</groupId>
+      <artifactId>bcprov-jdk18on</artifactId>
+      <version>${bouncycastle.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.commons</groupId>
+      <artifactId>commons-lang3</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-devtools</artifactId>
+      <scope>runtime</scope>
+      <optional>true</optional>
+    </dependency>
+    <dependency>
+      <groupId>org.projectlombok</groupId>
+      <artifactId>lombok</artifactId>
+      <optional>true</optional>
+    </dependency>
+    <!-- Telemetry: Micrometer Tracing bridged to OpenTelemetry, exported via OTLP. Versions are
+             managed by the spring-boot-starter-parent BOM (4.1.1) already in use above - no
+             explicit <version> needed, avoiding the kind of cross-library version conflicts that
+             arise when pinning OTel artifacts manually. spring-boot-starter-actuator is required:
+             Micrometer's auto-configuration for tracing/observability is wired through it.
+             spring-boot-opentelemetry / spring-boot-micrometer-tracing-opentelemetry are Boot
+             4.1's native OTLP logging/tracing autoconfiguration (management.opentelemetry.*
+             properties, including SSL bundle support for TLS) - micrometer-tracing-bridge-otel
+             and opentelemetry-exporter-otlp are still required explicitly since neither module
+             pulls in the actual OTLP transport implementation itself. -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-opentelemetry</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-micrometer-tracing-opentelemetry</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.micrometer</groupId>
+      <artifactId>micrometer-tracing-bridge-otel</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.opentelemetry</groupId>
+      <artifactId>opentelemetry-exporter-otlp</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.opentelemetry.instrumentation</groupId>
+      <artifactId>opentelemetry-logback-appender-1.0</artifactId>
+      <!--          <version>${otel.instrumentation.version}</version>-->
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.restdocs</groupId>
+      <artifactId>spring-restdocs-mockmvc</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.security</groupId>
+      <artifactId>spring-security-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.mockito</groupId>
+      <artifactId>mockito-core</artifactId>
+      <version>${mockito-junit-jupiter.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.mockito</groupId>
+      <artifactId>mockito-junit-jupiter</artifactId>
+      <version>${mockito-junit-jupiter.version}</version>
+      <scope>test</scope>
+    </dependency>
+
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <configuration>
+          <annotationProcessorPaths>
+            <path>
+              <groupId>org.projectlombok</groupId>
+              <artifactId>lombok</artifactId>
+            </path>
+          </annotationProcessorPaths>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+        <configuration>
+          <excludes>
+            <exclude>
+              <groupId>org.projectlombok</groupId>
+              <artifactId>lombok</artifactId>
+            </exclude>
+          </excludes>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <!-- Continue build even if tests fail -->
+          <testFailureIgnore>true</testFailureIgnore>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>com.diffplug.spotless</groupId>
+        <artifactId>spotless-maven-plugin</artifactId>
+        <version>${plugin.spotless}</version>
+        <configuration>
+          <json>
+            <includes>
+              <include>**/*.json</include>
+            </includes>
+            <gson>
+              <indentSpaces>4</indentSpaces>
+              <version>${plugin.spotless.gson}</version>
+            </gson>
+          </json>
+          <java>
+            <palantirJavaFormat>
+              <version>${plugin.spotless.palantir}</version>
+              <style>PALANTIR</style>
+            </palantirJavaFormat>
+          </java>
+          <pom>
+            <sortPom>
+              <nrOfIndentSpace>2</nrOfIndentSpace>
+              <endWithNewline>true</endWithNewline>
+              <expandEmptyElements>false</expandEmptyElements>
+              <predefinedSortOrder>recommended_2008_06</predefinedSortOrder>
+            </sortPom>
+          </pom>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.cyclonedx</groupId>
+        <artifactId>cyclonedx-maven-plugin</artifactId>
+        <version>${plugin.cyclonedx}</version>
+        <configuration>
+          <outputName>${project.artifactId}-${project.version}-bom</outputName>
+        </configuration>
+        <executions>
+          <execution>
+            <id>build-sbom-cyclonedx</id>
+            <goals>
+              <goal>makeAggregateBom</goal>
+            </goals>
+            <phase>package</phase>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.jacoco</groupId>
+        <artifactId>jacoco-maven-plugin</artifactId>
+        <version>${jacoco-maven-plugin.version}</version>
+        <configuration>
+          <excludes>
+            <exclude>**/dto/**</exclude>
+            <exclude>**/entity/**</exclude>
+            <exclude>**/exception/**</exclude>
+            <exclude>**/ManagementNodeApplication.java</exclude>
+          </excludes>
+        </configuration>
+        <executions>
+          <execution>
+            <id>prepare-agent</id>
+            <goals>
+              <goal>prepare-agent</goal>
+            </goals>
+          </execution>
+          <execution>
+            <id>report</id>
+            <goals>
+              <goal>report</goal>
+            </goals>
+            <phase>verify</phase>
+          </execution>
+          <execution>
+            <id>check</id>
+            <goals>
+              <goal>check</goal>
+            </goals>
+            <phase>verify</phase>
+            <configuration>
+              <haltOnFailure>false</haltOnFailure>
+              <rules>
+                <rule>
+                  <element>BUNDLE</element>
+                  <limits>
+                    <limit>
+                      <counter>INSTRUCTION</counter>
+                      <value>COVEREDRATIO</value>
+                      <minimum>0.80</minimum>
+                    </limit>
+                    <limit>
+                      <counter>BRANCH</counter>
+                      <value>COVEREDRATIO</value>
+                      <minimum>0.80</minimum>
+                    </limit>
+                    <limit>
+                      <counter>LINE</counter>
+                      <value>COVEREDRATIO</value>
+                      <minimum>0.80</minimum>
+                    </limit>
+                    <limit>
+                      <counter>METHOD</counter>
+                      <value>COVEREDRATIO</value>
+                      <minimum>0.80</minimum>
+                    </limit>
+                    <limit>
+                      <counter>CLASS</counter>
+                      <value>COVEREDRATIO</value>
+                      <minimum>0.50</minimum>
+                    </limit>
+                  </limits>
+                </rule>
+              </rules>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+
+</project>

@@ -1,0 +1,64 @@
+# =============================================================================
+# Certificate Manager — dev-dpn01 values
+# =============================================================================
+
+namespace: ns-dpn-01
+
+image:
+  repository: <<CONTAINER_REGISTRY_URL>>/dpn-federator-certificate-manager
+
+vault:
+  uri: "https://vault-https.ns-dpn-01.svc.cluster.local:8200"
+  authentication: APPROLE
+  pkiMount: pki-client
+  secretPath: pki-client/node-net/client   # matches manual deployment
+  appRole:
+    role: "certificate-manager"
+    roleId: "<<your specific value>>"
+    mountPath: "approle"
+
+oauth2:
+  tokenUri: "https://<<your specific value>>/realms/management-node/protocol/openid-connect/token"
+  clientId: "<<your specific value>>"
+  authMode: "private_key_jwt"
+  jwtAlgorithm: "RS256"
+
+managementNode:
+  baseUrl: "https://<<your specific value>>"
+
+cert:
+  renewalThresholdDays: "100"
+  subject:
+    country: "UK"
+    state: ""
+    locality: ""
+    org: "NESO"
+    ou: ""
+    cn: "dpn-dev-01"
+    altNames: "<<your specific value>>,<<your specific value>>,<<your specific value>>,<<your specific value>>"
+
+otel:
+  env:
+    OTEL_EXPORTER_OTLP_ENDPOINT: "https://dpn-otel-collector.ns-dpn-health-01.svc.cluster.local:4318"
+
+
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: 500m
+    memory: 1Gi
+
+keyvault:
+  enabled: true
+  clientID: "<<your specific value>>"
+  name: "<<your specific value>>"
+  tenantId: "<<your specific value>>"
+
+existingSecret:
+  name: "certificate-manager-secrets"
+
+vaultTruststore:
+  secretName: "cert-manager-truststore"

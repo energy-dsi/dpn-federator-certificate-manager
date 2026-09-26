@@ -1,0 +1,65 @@
+# =============================================================================
+# Vault HTTPS — AWS dev-dpn01 values
+# EKS     : <<your specific value>>
+# Account : <<your specific value>>
+# Region  : eu-west-2
+#
+# Content mirrors ../test-dpn01.yaml (deterministic substitution of
+# account/cluster/prefix identifiers only) — see that file for the
+# confirmed-working AWS pattern this is derived from.
+#
+# KMS key for Vault auto-unseal created 2026-09-17 for account <<your specific value>>
+# (arn:aws:kms:eu-west-2:<<your specific value>>:key/<<your specific value>>).
+# Still TODO: create the dpn-vault-kms-unseal-role IAM role (trust policy for
+# system:serviceaccount:ns-dpn-01:dpn-vault + kms:Encrypt/Decrypt/DescribeKey
+# on this key) before relying on this for real auto-unseal.
+# =============================================================================
+
+cloudProvider: aws
+
+image:
+  repository: "<<your specific value>>/vault"
+
+serviceAccount:
+  create: true
+  name: "dpn-vault"
+  irsaRoleArn: "<<your specific value>>"
+
+persistence:
+  size: 5Gi
+  storageClassName: gp3
+
+service:
+  aliasEnabled: true
+  lb:
+    # Temporarily disabled — the internal NLB was stuck in <pending> (AWS Load
+    # Balancer Controller IRSA trust-policy mismatch, since fixed) and helm
+    # upgrade --wait was timing out waiting on it even though the Vault pod
+    # itself was healthy. In-cluster consumers use the ClusterIP/alias service,
+    # not this LB, so this is safe to disable while LB provisioning is
+    # investigated separately. Re-enable once confirmed working.
+    enabled: true
+    externalTrafficPolicy: Local
+
+seal:
+  awsKms:
+    region: "eu-west-2"
+    kmsKeyArn: "arn:aws:kms:eu-west-2:<<your specific value>>:key/<<your specific value>>"
+
+secretsManager:
+  secretPrefix: "dpn/dev-dpn01/vault-https"
+
+vault:
+  uri: "https://vault-https.ns-dpn-01.svc.cluster.local:8200"
+  authentication: TOKEN
+  pkiMount: pki-client
+  secretPath: pki-client/node-net/client
+
+oauth2:
+  tokenUri: "https://<<your specific value>>/realms/management-node/protocol/openid-connect/token"
+  clientId: "<<your specific value>>"
+  authMode: "private_key_jwt"
+  jwtAlgorithm: "RS256"
+
+managementNode:
+  baseUrl: "https://<<your specific value>>"

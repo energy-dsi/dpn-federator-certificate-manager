@@ -1,0 +1,270 @@
+trigger: none
+
+# =============================================================================
+# Vault AppRole Setup — DPN Platform (certificate-manager)
+#
+# Configures the certificate-manager AppRole in a running Vault and publishes the
+# credential so the cert-manager chart's SecretProviderClass can consume it.
+#
+# In ONE run (against the target env's in-cluster Vault):
+#   - runs vault/setup-approle.sh in the Vault pod (admin token from Key Vault):
+#       * enables the `approle` auth method
+#       * writes the `certificate-manager-policy`
+#       * creates/updates the `certificate-manager` AppRole role
+#   - writes the generated secret-id to Key Vault as VAULT-APPROLE-SECRET-ID
+#     (sensitive — masked, never printed) with a +355-day expiry to satisfy the
+#     Key Vault governance policy. The cert-manager SecretProviderClass pulls this
+#     when vault.authentication=APPROLE. Re-run before expiry to rotate the secret-id.
+#   - prints the role-id (NOT sensitive) — set it in the env values file under
+#     vault.appRole.roleId, then flip vault.authentication to APPROLE and redeploy.
+#
+# The Vault admin/root token is read at runtime from Key Vault (VAULT-TOKEN); the
+# Vault pod is resolved dynamically. No token is hardcoded.
+#
+# Config resolved from: .pipelines/azure-pipelines/config/<env>-<cluster>.json
+#
+# Prerequisites:
+#   1. vault-https deployed + UNSEALED in the target cluster.
+#   2. Admin/root token in Key Vault as 'VAULT-TOKEN'.
+#   3. KV v2 enabled at 'pki-client'.
+# =============================================================================
+
+parameters:
+
+  - name: ServiceConnection
+    displayName: 'ServiceConnection details'
+    type: string
+    default: 'sc-dpn-dev-001'
+    values:
+      - sc-dpn-dev-001
+      - sc-dpn-dev-002
+      - sc-dpn-test-001
+      - sc-dpn-test-002
+      - sc-dpn-pdev-ppd-001
+      - sc-dpn-ptest-ppd-001
+      - sc-dpn-puat-ppd-001
+
+  - name: environment
+    displayName: Environment Name
+    type: string
+    default: 'dev'
+    values:
+      - dev
+      - devtest
+      - test
+      - pdev
+      - ptest
+      - puat
+
+  - name: dpnCluster
+    displayName: "Target DPN Cluster (pdev/ptest/puat have only one DPN — dpn02 is disabled for those environments)"
+    type: string
+    default: "dpn01"
+    values:
+      - dpn01
+      - dpn02
+
+variables:
+  - name: VAULT_FULL_NAME
+    value: "dpn-vault-https"
+  - name: VAULT_TOKEN_SECRET_NAME
+    value: "VAULT-TOKEN"
+
+  - name: PARAMETERS_FILE
+    value: ".pipelines/azure-pipelines/config/${{ parameters.environment }}-${{ parameters.dpnCluster }}.json"
+
+  - ${{ if or(eq(parameters.environment, 'pdev'), eq(parameters.environment, 'ptest'), eq(parameters.environment, 'puat')) }}:
+    - name: APPROVAL_GROUP
+      value: dsi-ppd
+  - ${{ elseif or(eq(parameters.environment, 'devtest'), eq(parameters.environment, 'test')) }}:
+    - name: APPROVAL_GROUP
+      value: dsi-devtest
+  - ${{ else }}:
+    - name: APPROVAL_GROUP
+      value: dsi-dev
+
+stages:
+
+# ============================================================
+# Guard — pdev/ptest/puat only have one DPN; dpn02 is disabled
+# ============================================================
+- stage: GuardSingleDpn
+  displayName: "Guard — Single DPN Environments"
+  # Runs on EVERY run and FAILS only for the invalid combo. Do NOT gate this
+  # stage with a `condition:` — a skipped guard makes downstream `succeeded()`
+  # stages skip too (a skip is NOT a success).
+  jobs:
+  - job: Block
+    pool:
+      name: "<<YOUR AGENT POOL>>"
+    steps:
+    - script: |
+        ENV="${{ parameters.environment }}"
+        CLUSTER="${{ parameters.dpnCluster }}"
+        if printf '%s' "$ENV" | grep -qE '^(pdev|ptest|puat)$' && [ "$CLUSTER" = "dpn02" ]; then
+          echo "##[error]dpn02 is disabled for environment '$ENV' — it has only a single DPN."
+          exit 1
+        fi
+        echo "Guard passed: environment '$ENV' with cluster '$CLUSTER' is a valid combination."
+      displayName: "Validate DPN cluster for environment"
+
+# ============================================================
+# Approval Gate (gated on the environment's approver group)
+# ============================================================
+- stage: Approval
+  displayName: "Approval Gate"
+
+  jobs:
+  - deployment: ApprovalJob
+    displayName: "Approve Vault AppRole setup"
+    environment: "$(APPROVAL_GROUP)"
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - script: |
+              echo "=========================================="
+              echo " APPROVAL REQUIRED BEFORE VAULT APPROLE SETUP"
+              echo "=========================================="
+              echo "Environment : ${{ parameters.environment }}"
+              echo "Cluster     : ${{ parameters.dpnCluster }}"
+              echo "=========================================="
+
+# ============================================================
+# Setup AppRole
+# Runs vault/setup-approle.sh in the Vault pod, then publishes the secret-id to
+# Key Vault and prints the role-id.
+# ============================================================
+- stage: SetupAppRole
+  displayName: "Vault AppRole Setup [${{ parameters.environment }}-${{ parameters.dpnCluster }}]"
+  dependsOn:
+  - GuardSingleDpn
+  - Approval
+  condition: succeeded()
+
+  jobs:
+  - deployment: SetupAppRole
+    displayName: "Configure AppRole + publish secret-id to Key Vault"
+    environment: "vault-approle-setup-${{ parameters.environment }}"
+    pool:
+      name: "<<YOUR AGENT POOL>>"
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - script: |
+              echo "Loading config from: $(PARAMETERS_FILE)"
+              for param in $(jq -r 'keys_unsorted | .[]' "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)"); do
+                value=$(jq -r ".\"$param\"" "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)")
+                echo "##vso[task.setvariable variable=$param]$value"
+              done
+            displayName: "Load Environment Config"
+
+          - task: AzureCLI@2
+            displayName: "Setup AppRole + publish secret-id"
+            inputs:
+              azureSubscription: "${{ parameters.ServiceConnection }}"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                echo "=========================================="
+                echo " AKS AUTH"
+                echo "=========================================="
+                which kubelogin >/dev/null 2>&1 || az aks install-cli --client-version v1.31.0 --kubelogin-version v0.1.4
+                az account set --subscription $(AZURE_SUBSCRIPTION_ID)
+                az aks get-credentials \
+                  --resource-group $(RESOURCE_GROUP) \
+                  --name $(AKS_CLUSTER) \
+                  --overwrite-existing
+                kubelogin convert-kubeconfig -l azurecli
+
+                echo "=========================================="
+                echo " RESOLVE VAULT POD"
+                echo "=========================================="
+                POD=$(kubectl get pod -n $(NAMESPACE) -l app=$(VAULT_FULL_NAME) \
+                  -o jsonpath='{.items[0].metadata.name}')
+                if [ -z "$POD" ]; then
+                  echo "##[error]No vault pod found (app=$(VAULT_FULL_NAME)) in namespace $(NAMESPACE)."
+                  exit 1
+                fi
+                echo "Using vault pod: $POD"
+
+                echo "=========================================="
+                echo " FETCH ADMIN TOKEN FROM KEY VAULT"
+                echo "=========================================="
+                VAULT_TOKEN=$(az keyvault secret show \
+                  --vault-name $(KEY_VAULT_NAME) \
+                  --name $(VAULT_TOKEN_SECRET_NAME) \
+                  --query "value" -o tsv 2>/dev/null || true)
+                if [ -z "$VAULT_TOKEN" ]; then
+                  echo "##[error]$(VAULT_TOKEN_SECRET_NAME) not found in Key Vault $(KEY_VAULT_NAME)."
+                  exit 1
+                fi
+                echo "##vso[task.setvariable variable=VAULT_TOKEN;issecret=true]$VAULT_TOKEN"
+                echo "Admin token retrieved from Key Vault."
+
+                echo "=========================================="
+                echo " COPY SETUP SCRIPT + POLICY INTO POD"
+                echo "=========================================="
+                kubectl cp vault/setup-approle.sh \
+                  $(NAMESPACE)/$POD:/tmp/setup-approle.sh
+                kubectl cp vault/certificate-manager-policy.hcl \
+                  $(NAMESPACE)/$POD:/tmp/certificate-manager-policy.hcl
+
+                echo "=========================================="
+                echo " RUN setup-approle.sh (output captured, NOT logged)"
+                echo "=========================================="
+                # setup-approle.sh prints the secret-id, so capture its output into a
+                # variable and never echo it. Parse role_id (1st UUID) + secret_id (2nd).
+                UUID='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+                SETUP_OUT=$(kubectl exec -n $(NAMESPACE) "$POD" -- sh -c "
+                  tr -d '\r' < /tmp/setup-approle.sh > /tmp/sa.sh &&
+                  VAULT_ADDR='https://127.0.0.1:8200' VAULT_SKIP_VERIFY='true' VAULT_TOKEN='$VAULT_TOKEN' sh /tmp/sa.sh
+                " 2>&1 || true)
+                ROLE_ID=$(printf '%s\n' "$SETUP_OUT"   | grep -ioE "$UUID" | sed -n 1p || true)
+                SECRET_ID=$(printf '%s\n' "$SETUP_OUT" | grep -ioE "$UUID" | sed -n 2p || true)
+                if [ -z "$ROLE_ID" ] || [ -z "$SECRET_ID" ]; then
+                  echo "##[error]Could not parse role_id/secret_id from setup-approle.sh output."
+                  echo "##[error]Check that Vault is unsealed and the admin token is valid."
+                  exit 1
+                fi
+                echo "##vso[task.setvariable variable=SECRET_ID;issecret=true]$SECRET_ID"
+                echo "AppRole role + policy configured; role_id + secret_id obtained."
+
+                echo "=========================================="
+                echo " PUBLISH secret-id TO KEY VAULT $(KEY_VAULT_NAME)"
+                echo "=========================================="
+                # Azure governance policy 'Secrets should have the specified maximum
+                # validity period' rejects any Key Vault secret without an expiry, so we
+                # stamp +355 days (matching the other DPN pipelines). NOTE: the AppRole
+                # secret-id itself does not expire (secret_id_ttl=0), so RE-RUN this
+                # pipeline before the Key Vault copy expires to rotate it — a re-run
+                # generates a fresh secret-id and refreshes the expiry, then redeploy.
+                EXPIRY="$(date -u -d '+355 days' '+%Y-%m-%d')T00:00:00Z"
+                az keyvault secret set \
+                  --vault-name $(KEY_VAULT_NAME) \
+                  --name VAULT-APPROLE-SECRET-ID \
+                  --value "$SECRET_ID" \
+                  --expires "$EXPIRY" \
+                  --output none
+                echo "Stored VAULT-APPROLE-SECRET-ID in Key Vault $(KEY_VAULT_NAME) (expires $EXPIRY)."
+
+                echo "=========================================="
+                echo " CLEANUP POD TEMP FILES"
+                echo "=========================================="
+                kubectl exec -n $(NAMESPACE) "$POD" -- rm -f \
+                  /tmp/setup-approle.sh /tmp/certificate-manager-policy.hcl /tmp/sa.sh || true
+
+                echo ""
+                echo "=========================================================================="
+                echo " role_id (NOT sensitive) — set this in"
+                echo "   charts/certificate-manager/values-${{ parameters.environment }}-${{ parameters.dpnCluster }}.yaml"
+                echo " under vault.appRole.roleId, then set vault.authentication: APPROLE and redeploy:"
+                echo ""
+                echo "   $ROLE_ID"
+                echo "=========================================================================="

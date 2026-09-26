@@ -13,7 +13,7 @@ spring:
       jks:
         otel-collector:
           truststore:
-            password: changeit
+            password: ""
 
 resilience4j:
   retry:

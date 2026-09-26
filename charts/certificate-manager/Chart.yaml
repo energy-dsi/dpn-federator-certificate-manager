@@ -1,0 +1,13 @@
+apiVersion: v2
+name: certificate-manager
+description: DPN Federator Certificate Lifecycle Manager — manages mTLS keystore/truststore via Vault PKI
+type: application
+version: 0.1.0
+appVersion: "latest"
+keywords:
+  - certificate-manager
+  - mtls
+  - vault
+  - dpn
+maintainers:
+  - name: Platform Engineering

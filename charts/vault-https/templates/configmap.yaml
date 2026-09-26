@@ -1,0 +1,36 @@
+{{- $name := .Values.fullnameOverride | default .Release.Name }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-config
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ $name }}
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  vault.hcl: |
+    ui = true
+
+    listener "tcp" {
+      address       = "0.0.0.0:8200"
+      tls_disable   = 0
+      tls_cert_file = "/vault/tls/vault.crt"
+      tls_key_file  = "/vault/tls/vault.key"
+    }
+
+    storage "file" {
+      path = "{{ .Values.vault.storagePath }}"
+    }
+
+    seal "azurekeyvault" {
+      tenant_id  = "{{ .Values.seal.azureKeyVault.tenantId }}"
+      client_id  = "{{ .Values.seal.azureKeyVault.clientId }}"
+      vault_name = "{{ .Values.seal.azureKeyVault.keyVaultName }}"
+      key_name   = "{{ .Values.seal.azureKeyVault.keyName }}"
+    }
+
+    disable_mlock = true
+
+    api_addr     = "https://0.0.0.0:8200"
+    cluster_addr = "https://0.0.0.0:8201"

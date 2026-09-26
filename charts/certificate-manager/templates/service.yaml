@@ -1,0 +1,24 @@
+{{- if .Values.service.enabled }}
+{{- $name := include "certificate-manager.name" . }}
+# =============================================================================
+# Certificate Manager — Service
+# Disabled by default — CLM has no inbound HTTP traffic.
+# Enable if you expose Spring Actuator endpoints for monitoring.
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "certificate-manager.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "certificate-manager.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.port }}
+      protocol: TCP
+{{- end }}

@@ -1,0 +1,278 @@
+trigger: none
+
+# =============================================================================
+# Keycloak TLS material — DPN Platform
+#
+# Self-signed generator for the DPN Keycloak (DSM auth) TLS material, using the
+# same kind of self-signed "common DPN certificate" that Vault uses. In ONE run:
+#   - generates a self-signed DPN Root CA (CN=dpn-root)
+#   - generates the Keycloak server cert (CN=dsm-server) with WILDCARD SANs
+#       *.ns-dpn-01.svc.cluster.local  and  *.ns-dpn-health-01.svc.cluster.local
+#   - builds  keystore.jks  (server identity)
+#             truststore.jks (dpn-root + dpn-client-ca)
+#             dpn-client.p12 (client cert for mTLS / browser install)
+#   - PUBLISHES keystore.jks / truststore.jks / dpn-client.p12 as a pipeline artifact
+#   - CREATES generic k8s secret 'dpn-tls' holding keystore.jks + truststore.jks
+#     (the Keycloak chart mounts it at /cert; point its tlsSecretName at dpn-tls)
+#   - (optional) stores the store passwords in Key Vault under the names the Keycloak
+#     SecretProviderClass expects: KC-HTTPS-KEY-STORE-PASSWORD,
+#     KC-HTTPS-TRUST-STORE-PASSWORD, KC-SPI-TRUSTSTORE-FILE-PASSWORD
+#     (aligned with dsm-management-node/charts/keycloak)
+#
+# Customer inputs: Country (C), Organisation (O), store passwords, target namespace.
+# SANs are FIXED (wildcards) in create-keycloak-tls.sh.
+#
+# Config resolved from: .pipelines/azure-pipelines/config/<env>-<cluster>.json
+#
+# SEGREGATED for now. Once proven, merge with create-vault-tls-bootstrap.sh /
+# vault-tls-bootstrap-cd.yaml so Vault + Keycloak chain to ONE common DPN Root CA.
+# =============================================================================
+
+parameters:
+
+  - name: ServiceConnection
+    displayName: 'ServiceConnection details'
+    type: string
+    default: 'sc-dpn-dev-001'
+    values:
+      - sc-dpn-dev-001
+      - sc-dpn-dev-002
+      - sc-dpn-test-001
+      - sc-dpn-test-002
+      - sc-dpn-pdev-ppd-001
+      - sc-dpn-ptest-ppd-001
+      - sc-dpn-puat-ppd-001
+
+  - name: environment
+    displayName: Environment Name
+    type: string
+    default: 'dev'
+    values:
+      - dev
+      - devtest
+      - test
+      - pdev
+      - ptest
+      - puat
+
+  - name: dpnCluster
+    displayName: "Target DPN Cluster (pdev/ptest/puat have only one DPN — dpn02 is disabled for those environments)"
+    type: string
+    default: "dpn01"
+    values:
+      - dpn01
+      - dpn02
+
+  - name: targetNamespace
+    displayName: "Namespace for the dpn-tls secret (where Keycloak runs)"
+    type: string
+    default: "ns-dpn-01"
+    values:
+      - ns-dpn-01
+      - ns-dpn-health-01
+
+  - name: country
+    displayName: "Country (C)"
+    type: string
+    default: "GB"
+
+  - name: org
+    displayName: "Organisation (O)"
+    type: string
+    default: "DSI"
+
+  - name: keystorePassword
+    displayName: "keystore.jks password"
+    type: string
+    default: "changeit"
+
+  - name: truststorePassword
+    displayName: "truststore.jks password"
+    type: string
+    default: "changeit"
+
+  - name: clientP12Password
+    displayName: "dpn-client.p12 password"
+    type: string
+    default: "changeit"
+
+  - name: storePasswordsInKeyVault
+    displayName: "Also store the store passwords in Key Vault?"
+    type: boolean
+    default: true
+
+variables:
+  - name: PARAMETERS_FILE
+    value: ".pipelines/azure-pipelines/config/${{ parameters.environment }}-${{ parameters.dpnCluster }}.json"
+
+  - ${{ if or(eq(parameters.environment, 'pdev'), eq(parameters.environment, 'ptest'), eq(parameters.environment, 'puat')) }}:
+    - name: APPROVAL_GROUP
+      value: dsi-ppd
+  - ${{ elseif or(eq(parameters.environment, 'devtest'), eq(parameters.environment, 'test')) }}:
+    - name: APPROVAL_GROUP
+      value: dsi-devtest
+  - ${{ else }}:
+    - name: APPROVAL_GROUP
+      value: dsi-dev
+
+stages:
+
+# ============================================================
+# Guard — pdev/ptest/puat only have one DPN; dpn02 is disabled
+# ============================================================
+- stage: GuardSingleDpn
+  displayName: "Guard — Single DPN Environments"
+  # Runs on EVERY run and FAILS only for the invalid combo. Do NOT gate this
+  # stage with a `condition:` — a skipped guard makes the downstream
+  # `condition: succeeded()` stages skip too (a skip is NOT a success).
+  jobs:
+  - job: Block
+    pool:
+      name: "<<YOUR AGENT POOL>>"
+    steps:
+    - script: |
+        ENV="${{ parameters.environment }}"
+        CLUSTER="${{ parameters.dpnCluster }}"
+        if printf '%s' "$ENV" | grep -qE '^(pdev|ptest|puat)$' && [ "$CLUSTER" = "dpn02" ]; then
+          echo "##[error]dpn02 is disabled for environment '$ENV' — it has only a single DPN."
+          exit 1
+        fi
+        echo "Guard passed: environment '$ENV' with cluster '$CLUSTER' is a valid combination."
+      displayName: "Validate DPN cluster for environment"
+
+# ============================================================
+# Approval Gate (gated on the environment's approver group)
+# ============================================================
+- stage: Approval
+  displayName: "Approval Gate"
+
+  jobs:
+  - deployment: ApprovalJob
+    displayName: "Approve Keycloak TLS generation"
+    environment: "$(APPROVAL_GROUP)"
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - script: |
+              echo "=========================================="
+              echo " APPROVAL REQUIRED BEFORE KEYCLOAK TLS GENERATION"
+              echo "=========================================="
+              echo "Environment : ${{ parameters.environment }}"
+              echo "Cluster     : ${{ parameters.dpnCluster }}"
+              echo "Namespace   : ${{ parameters.targetNamespace }}"
+              echo "=========================================="
+
+# ============================================================
+# Generate Keycloak TLS + publish artifact + create dpn-tls secret
+# ============================================================
+- stage: KeycloakTls
+  displayName: "Keycloak TLS [${{ parameters.environment }}-${{ parameters.dpnCluster }}]"
+  dependsOn:
+  - GuardSingleDpn
+  - Approval
+  condition: succeeded()
+
+  jobs:
+  - deployment: KeycloakTls
+    displayName: "Generate Keycloak TLS, publish artifact, create dpn-tls secret"
+    environment: "keycloak-tls-${{ parameters.environment }}"
+    pool:
+      name: "<<YOUR AGENT POOL>>"
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - script: |
+              echo "Loading config from: $(PARAMETERS_FILE)"
+              for param in $(jq -r 'keys_unsorted | .[]' "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)"); do
+                value=$(jq -r ".\"$param\"" "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)")
+                echo "##vso[task.setvariable variable=$param]$value"
+              done
+            displayName: "Load Environment Config"
+
+          - task: AzureCLI@2
+            displayName: "Generate Keycloak TLS + publish dpn-tls secret"
+            inputs:
+              azureSubscription: "${{ parameters.ServiceConnection }}"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                echo "=========================================="
+                echo " STORE PASSWORDS (masked)"
+                echo "=========================================="
+                KEYSTORE_PASS="${{ parameters.keystorePassword }}"
+                TRUSTSTORE_PASS="${{ parameters.truststorePassword }}"
+                CLIENT_P12_PASS="${{ parameters.clientP12Password }}"
+                echo "##vso[task.setvariable variable=KEYSTORE_PASS;issecret=true]$KEYSTORE_PASS"
+                echo "##vso[task.setvariable variable=TRUSTSTORE_PASS;issecret=true]$TRUSTSTORE_PASS"
+                echo "##vso[task.setvariable variable=CLIENT_P12_PASS;issecret=true]$CLIENT_P12_PASS"
+
+                OUT_DIR="$(Build.ArtifactStagingDirectory)/keycloak-tls"
+
+                echo "=========================================="
+                echo " GENERATE KEYCLOAK TLS (self-signed, wildcard SANs)"
+                echo "=========================================="
+                COUNTRY="${{ parameters.country }}" \
+                ORG="${{ parameters.org }}" \
+                KEYSTORE_PASS="$KEYSTORE_PASS" \
+                TRUSTSTORE_PASS="$TRUSTSTORE_PASS" \
+                CLIENT_P12_PASS="$CLIENT_P12_PASS" \
+                OUT_DIR="$OUT_DIR" \
+                sh .pipelines/scripts/create-keycloak-tls.sh
+
+                if [ "${{ parameters.storePasswordsInKeyVault }}" = "True" ]; then
+                  echo "=========================================="
+                  echo " STORE PASSWORDS IN KEY VAULT $(KEY_VAULT_NAME)"
+                  echo "=========================================="
+                  EXPIRY="$(date -u -d '+355 days' '+%Y-%m-%d')T00:00:00Z"
+                  # Object names MATCH dsm-management-node/charts/keycloak keyvault-secretproviderclass.yaml
+                  # so the Keycloak SecretProviderClass consumes them directly:
+                  #   KC-HTTPS-KEY-STORE-PASSWORD    -> KC_HTTPS_KEY_STORE_PASSWORD (+ client keystore/key)
+                  #   KC-HTTPS-TRUST-STORE-PASSWORD  -> KC_HTTPS_TRUST_STORE_PASSWORD
+                  #   KC-SPI-TRUSTSTORE-FILE-PASSWORD-> KC_SPI_TRUSTSTORE_FILE_PASSWORD (same truststore.jks)
+                  az keyvault secret set --vault-name $(KEY_VAULT_NAME) --name KC-HTTPS-KEY-STORE-PASSWORD     --value "$KEYSTORE_PASS"   --expires "$EXPIRY" --output none
+                  az keyvault secret set --vault-name $(KEY_VAULT_NAME) --name KC-HTTPS-TRUST-STORE-PASSWORD   --value "$TRUSTSTORE_PASS" --expires "$EXPIRY" --output none
+                  az keyvault secret set --vault-name $(KEY_VAULT_NAME) --name KC-SPI-TRUSTSTORE-FILE-PASSWORD --value "$TRUSTSTORE_PASS" --expires "$EXPIRY" --output none
+                  # dpn-client.p12 is for a browser/external mTLS client, NOT consumed by Keycloak:
+                  az keyvault secret set --vault-name $(KEY_VAULT_NAME) --name DPN-CLIENT-P12-PASSWORD         --value "$CLIENT_P12_PASS" --expires "$EXPIRY" --output none
+                  echo "Stored KC-HTTPS-KEY-STORE-PASSWORD, KC-HTTPS-TRUST-STORE-PASSWORD, KC-SPI-TRUSTSTORE-FILE-PASSWORD (+ DPN-CLIENT-P12-PASSWORD)."
+                fi
+
+                echo "=========================================="
+                echo " AKS AUTH"
+                echo "=========================================="
+                which kubelogin >/dev/null 2>&1 || az aks install-cli --client-version v1.31.0 --kubelogin-version v0.1.4
+                az account set --subscription $(AZURE_SUBSCRIPTION_ID)
+                az aks get-credentials \
+                  --resource-group $(RESOURCE_GROUP) \
+                  --name $(AKS_CLUSTER) \
+                  --overwrite-existing
+                kubelogin convert-kubeconfig -l azurecli
+
+                echo "=========================================="
+                echo " CREATE K8s SECRET dpn-tls (keystore.jks + truststore.jks, ns=${{ parameters.targetNamespace }})"
+                echo "=========================================="
+                # GENERIC secret (NOT kubernetes.io/tls): the Keycloak chart mounts it at /cert
+                # and reads /cert/keystore.jks + /cert/truststore.jks. Set the chart's
+                # tlsSecretName to 'dpn-tls' (chart default is dsm-tls).
+                # Use delete+create (not dry-run|apply) so the base64 keystore (with its private
+                # key) is NOT printed into the pipeline log.
+                kubectl delete secret dpn-tls -n ${{ parameters.targetNamespace }} --ignore-not-found >/dev/null 2>&1
+                kubectl create secret generic dpn-tls \
+                  --namespace ${{ parameters.targetNamespace }} \
+                  --from-file=keystore.jks="$OUT_DIR/keystore.jks" \
+                  --from-file=truststore.jks="$OUT_DIR/truststore.jks"
+                echo "Secret 'dpn-tls' (keystore.jks + truststore.jks) created/updated in namespace ${{ parameters.targetNamespace }}."
+                echo "NOTE: point the Keycloak chart's tlsSecretName at 'dpn-tls'."
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish keystore.jks + truststore.jks + dpn-client.p12"
+            inputs:
+              targetPath: "$(Build.ArtifactStagingDirectory)/keycloak-tls"
+              artifact: "keycloak-tls-${{ parameters.environment }}-${{ parameters.dpnCluster }}"

@@ -1,0 +1,235 @@
+name: DPN CD - Vault TLS Bootstrap
+
+# =============================================================================
+# Vault TLS + Truststore Bootstrap — DPN Platform   (PART 1 of 2)
+#
+# GitHub Actions parity for the ADO 'vault-tls-bootstrap-cd' pipeline.
+# In ONE run it:
+#   - generates a self-signed Root CA (CN=dpn-vault-root)
+#   - generates the Vault leaf key + cert (CN=vault, fixed SANs)
+#   - builds the PKCS12 truststore.jks (Root CA as trust anchor)
+#   - publishes to Azure Key Vault (from the env config JSON):
+#       VAULT-TLS-CERT            <- vault.crt
+#       VAULT-TLS-KEY             <- vault.key
+#       VAULT-TRUSTSTORE-PASSWORD <- repo secret DPN_TLS_TRUSTSTORE_PASSWORD
+#   - publishes truststore.jks to the 'cert-manager-truststore' K8s secret
+#
+# PART 2 (load the DSM-signed client bundle into Vault) is dpn-vault-load-bundle-cd.yml.
+# Deploy / init Vault itself with dpn-vault-https-cd.yml.
+#
+# The truststore password is read from the repo secret DPN_TLS_TRUSTSTORE_PASSWORD
+# (the same secret dpn-tls-cd.yaml uses) — never a plain-text workflow input, since
+# GitHub Actions has no secret-typed workflow_dispatch input and any string input
+# is always visible in the "Run workflow" form regardless of log masking.
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Select Environment"
+        required: true
+        default: "test"
+        type: choice
+        options:
+          - dev
+          - test
+
+      cluster:
+        description: "Target DPN Cluster"
+        required: true
+        default: "dpn01"
+        type: choice
+        options:
+          - dpn01
+          - dpn02
+
+      cloud:
+        description: "Target Cloud Provider"
+        required: true
+        default: "aws"
+        type: choice
+        options:
+          - azure
+          - aws
+          - gcp
+
+      country:
+        description: "Country (C)"
+        required: true
+        default: "GB"
+        type: string
+
+      org:
+        description: "Organisation (O)"
+        required: true
+        default: "DSI"
+        type: string
+
+      sans:
+        description: "Extra comma-separated DNS SANs (the internal k8s DNS name is always added)"
+        required: false
+        default: ""
+        type: string
+
+env:
+  PARAMETERS_FILE: .github/config/${{ inputs.cloud }}/${{ inputs.environment }}-${{ inputs.cluster }}.json
+  BOOTSTRAP_SCRIPT: dpn-federator-cert-manager/scripts/create-vault-tls-bootstrap.sh
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  bootstrap:
+    name: Bootstrap Vault TLS + publish to Key Vault
+    runs-on: [self-hosted, vmss]
+    environment: ${{ inputs.environment }}-${{ inputs.cluster }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Applied Parameters
+        shell: bash
+        run: |
+          echo "environment=${{ inputs.environment }}"
+          echo "cluster=${{ inputs.cluster }}"
+          echo "cloud=${{ inputs.cloud }}"
+          echo "country=${{ inputs.country }}"
+          echo "org=${{ inputs.org }}"
+          echo "sans=${{ inputs.sans }}"
+          echo "truststorePassword=${{ inputs.truststorePassword }}"
+
+      - name: Read Deployment Config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "${PARAMETERS_FILE}" ]; then
+            echo "ERROR: ${PARAMETERS_FILE} not found!"
+            exit 1
+          fi
+
+          echo "Loading config from ${PARAMETERS_FILE}"
+          for key in $(jq -r 'keys_unsorted[]' "${PARAMETERS_FILE}"); do
+            value=$(jq -r ".\"$key\"" "${PARAMETERS_FILE}")
+            echo "${key}=${value}" >> "$GITHUB_ENV"
+            echo "Set ${key}"
+          done
+
+      # Mask the truststore password so it never appears in logs. It is provided
+      # as a workflow_dispatch input (matching the ADO 'truststorePassword' param),
+      # so no pre-created Actions secret is required.
+      - name: Mask Truststore Password
+        shell: bash
+        env:
+          TRUSTSTORE_PASS: ${{ inputs.truststorePassword }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TRUSTSTORE_PASS:-}" ]; then
+            echo "::error::truststorePassword input is empty."
+            exit 1
+          fi
+          echo "::add-mask::${TRUSTSTORE_PASS}"
+          echo "Truststore password received and masked."
+
+      - name: Cloud Login
+        uses: ./.github/actions/cloud-login
+        with:
+          cloud: ${{ inputs.cloud }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          aws-region: ${{ env.AWS_REGION }}
+          aws-account-id: ${{ env.AWS_ACCOUNT_ID }}
+          eks-cluster: ${{ env.EKS_CLUSTER }}
+
+      # keytool is REQUIRED to build a truststore Java (cert-manager) accepts.
+      # openssl PKCS12 'trust' stores are read by Java as having no trust anchors.
+      - name: Setup Java (keytool)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Generate Vault TLS + Truststore
+        shell: bash
+        env:
+          TRUSTSTORE_PASS: ${{ secrets.DPN_TLS_TRUSTSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          OUT_DIR="${RUNNER_TEMP}/vault-tls"
+          echo "OUT_DIR=${OUT_DIR}" >> "$GITHUB_ENV"
+
+          chmod +x "$BOOTSTRAP_SCRIPT"
+          COUNTRY="${{ inputs.country }}" \
+          ORG="${{ inputs.org }}" \
+          TRUSTSTORE_PASS="$TRUSTSTORE_PASS" \
+          SAN_NAMESPACE="$NAMESPACE" \
+          EXTRA_SANS="${{ inputs.sans }}" \
+          OUT_DIR="$OUT_DIR" \
+          bash "$BOOTSTRAP_SCRIPT"
+
+      - name: Publish TLS Material to Key Vault
+        shell: bash
+        env:
+          TRUSTSTORE_PASS: ${{ secrets.DPN_TLS_TRUSTSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          # Expiry = +365 days (1 year); within the AKV maximum-validity policy cap
+          EXPIRY="$(date -u -d '+365 days' '+%Y-%m-%d')T00:00:00Z"
+          echo "Secret expiry: $EXPIRY"
+
+          az keyvault secret set \
+            --vault-name "$KEY_VAULT_NAME" \
+            --name VAULT-TLS-CERT \
+            --file "$OUT_DIR/certs/vault.crt" \
+            --expires "$EXPIRY" \
+            --output none
+
+          az keyvault secret set \
+            --vault-name "$KEY_VAULT_NAME" \
+            --name VAULT-TLS-KEY \
+            --file "$OUT_DIR/certs/vault.key" \
+            --expires "$EXPIRY" \
+            --output none
+
+          az keyvault secret set \
+            --vault-name "$KEY_VAULT_NAME" \
+            --name VAULT-TRUSTSTORE-PASSWORD \
+            --value "$TRUSTSTORE_PASS" \
+            --expires "$EXPIRY" \
+            --output none
+
+          echo "Wrote VAULT-TLS-CERT, VAULT-TLS-KEY, VAULT-TRUSTSTORE-PASSWORD to $KEY_VAULT_NAME."
+
+      - name: Publish cert-manager-truststore K8s Secret
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl create secret generic cert-manager-truststore \
+            --namespace "$NAMESPACE" \
+            --from-file=truststore.jks="$OUT_DIR/truststore.jks" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          echo "Secret 'cert-manager-truststore' created/updated in namespace $NAMESPACE."
+          echo "NOTE: restart certificate-manager to pick up the new truststore:"
+          echo "  kubectl rollout restart deployment/dpn-certificate-manager -n $NAMESPACE"
+
+      # Publish the FULL working set as an artifact:
+      #   ca/rootCA.key, ca/rootCA.crt
+      #   certs/vault-openssl.cnf, certs/vault.key, certs/vault.csr, certs/vault.crt
+      #   truststore.jks
+      # WARNING: contains PRIVATE KEYS (ca/rootCA.key, certs/vault.key). Download it,
+      # move the keys to secure storage (e.g. Key Vault), then delete the artifact.
+      - name: Publish Vault TLS Artifact (full working set)
+        uses: actions/upload-artifact@v4
+        with:
+          name: vault-tls-${{ inputs.environment }}-${{ inputs.cluster }}
+          path: |
+            ${{ env.OUT_DIR }}/ca
+            ${{ env.OUT_DIR }}/certs
+            ${{ env.OUT_DIR }}/truststore.jks
+          retention-days: 1

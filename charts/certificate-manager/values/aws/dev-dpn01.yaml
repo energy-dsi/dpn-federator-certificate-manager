@@ -1,0 +1,110 @@
+# =============================================================================
+# Certificate Manager — AWS dev-dpn01 values
+# EKS     : <<your specific value>>
+# Account : <<your specific value>>
+# Region  : eu-west-2
+#
+# Content mirrors ../test-dpn01.yaml (deterministic substitution of
+# account/cluster/prefix identifiers only) — see that file for the
+# confirmed-working AWS pattern this is derived from.
+#
+# EXCEPTION: vault.appRole.roleId is NOT carried over from test-dpn01/test-dpn02 —
+# it's a real, per-cluster Vault AppRole role_id (confirmed non-transferable
+# between clusters). Provisioned specifically for dev-dpn01 on 2026-09-17 — see
+# note below.
+# =============================================================================
+
+cloudProvider: aws
+
+namespace: ns-dpn-01
+
+image:
+  repository: <<your specific value>>/dpn-federator-certificate-manager
+
+vault:
+  uri: "https://vault-https.ns-dpn-01.svc.cluster.local:8200"
+  authentication: APPROLE
+  pkiMount: pki-client
+  secretPath: pki-client/node-net/client
+  appRole:
+    role: "certificate-manager"
+    # Provisioned 2026-09-17 via "DPN CD - Certificate Manager Role ID
+    # Creation" (component=certificate-manager, environment=dev, cluster=dpn01,
+    # cloud=aws), scoped to this cluster's own Vault mount. role_id is not
+    # sensitive so it's safe to commit here; the paired secret_id lives only
+    # in Secrets Manager at dpn/dev-dpn01/certificate-manager/VAULT_APPROLE_SECRET_ID
+    # (auto-stored there by that same pipeline run).
+    roleId: "<<your specific value>>"
+    mountPath: "approle"
+
+# TODO: confirm with app team before real deploy — placeholders carried over
+# from ../test-dpn01.yaml, same as that file's own TODO.
+oauth2:
+  tokenUri: "https://<<your specific value>>/realms/management-node/protocol/openid-connect/token"
+  clientId: "<<your specific value>>"
+  authMode: "private_key_jwt"
+  jwtAlgorithm: "RS256"
+
+managementNode:
+  baseUrl: "https://<<your specific value>>"
+
+cert:
+  renewalThresholdDays: "100"
+  subject:
+    country: "UK"
+    state: ""
+    locality: ""
+    org: "NESO"
+    ou: ""
+    cn: "<<your specific value>>"
+    altNames: "<<your specific value>>,<<your specific value>>"
+
+otel:
+  env:
+    OTEL_EXPORTER_OTLP_ENDPOINT: "http://dpn-otel-collector.ns-dpn-health-01.svc.cluster.local:4318"
+
+# --------------------------------------------------
+# Shared EFS Access Point (dynamic provisioning via efs-sc StorageClass).
+# On test-dpn01/test-dpn02 this StorageClass already carries a confirmed
+# real fileSystemId (fs-0ba760305c507a1b6 / fs-0d9c5ede910afcf3f respectively).
+# TODO: no fileSystemId has been confirmed for the dev-dpn01 EKS cluster's
+# efs-sc StorageClass — verify the StorageClass exists on dev-dpn01 and
+# carries a real EFS filesystem ID before deploy.
+# --------------------------------------------------
+fileShare:
+  create: true
+  storageClassName: efs-sc
+  size: "1Gi"
+  pvcName: pvc-dpn-certs-fileshare
+
+# --------------------------------------------------
+# AWS Secrets Manager — no dedicated IRSA role for this POC (default SA).
+# Secrets must be created under this prefix before deploy:
+#   dpn/dev-dpn01/certificate-manager/MTLS_KEYSTORE_PASSWORD
+#   dpn/dev-dpn01/certificate-manager/MTLS_TRUSTSTORE_PASSWORD
+#   dpn/dev-dpn01/certificate-manager/VAULT_TOKEN
+#   dpn/dev-dpn01/certificate-manager/OAUTH2_CLIENT_SECRET
+#   dpn/dev-dpn01/certificate-manager/VAULT_TRUSTSTORE_PASSWORD
+# --------------------------------------------------
+secretsManager:
+  enabled: true
+  secretPrefix: "dpn/dev-dpn01/certificate-manager"
+
+serviceAccount:
+  create: true
+  name: "dpn-certificate-manager"
+  irsaRoleArn: "<<your specific value>>"
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: 500m
+    memory: 1Gi
+
+existingSecret:
+  name: "certificate-manager-secrets"
+
+vaultTruststore:
+  secretName: "cert-manager-truststore"

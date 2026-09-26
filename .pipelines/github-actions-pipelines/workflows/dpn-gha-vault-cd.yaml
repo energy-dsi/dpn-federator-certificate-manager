@@ -1,0 +1,205 @@
+name: DPN CD - Vault
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Select Environment"
+        required: true
+        default: "test"
+        type: choice
+        options:
+          - dev
+          - test
+
+      cluster:
+        description: "Target DPN Cluster"
+        required: true
+        default: "dpn01"
+        type: choice
+        options:
+          - dpn01
+          - dpn02
+
+      cloud:
+        description: "Target Cloud Provider"
+        required: true
+        default: "aws"
+        type: choice
+        options:
+          - azure
+          - aws
+          - gcp
+
+      vaultImageTag:
+        description: "Vault image tag (e.g. 1.16)"
+        required: true
+        default: "1.16"
+        type: string
+
+      vaultImageRepository:
+        description: "Vault image path AFTER <<your specific value>>/ (e.g. 1.0.1/vault) — leave blank to use the environment's configured repository"
+        required: false
+        default: ""
+        type: string
+
+env:
+  PARAMETERS_FILE: .github/config/${{ inputs.cloud }}/${{ inputs.environment }}-${{ inputs.cluster }}.json
+  CHART_DIR: dpn-federator-cert-manager/charts/vault
+  RELEASE_NAME: vault
+  VALUES_FILE: dpn-federator-cert-manager/charts/vault/values/${{ inputs.cloud }}/${{ inputs.environment }}-${{ inputs.cluster }}.yaml
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Helm Deploy
+    runs-on: [self-hosted, vmss]
+    environment: ${{ inputs.environment }}-${{ inputs.cluster }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Applied Parameters
+        shell: bash
+        run: |
+          echo "environment=${{ inputs.environment }}"
+          echo "cluster=${{ inputs.cluster }}"
+          echo "cloud=${{ inputs.cloud }}"
+          echo "vaultImageTag=${{ inputs.vaultImageTag }}"
+          echo "vaultImageRepository=${{ inputs.vaultImageRepository }}"
+
+      - name: Read Deployment Config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "${PARAMETERS_FILE}" ]; then
+            echo "ERROR: ${PARAMETERS_FILE} not found!"
+            exit 1
+          fi
+
+          echo "Loading config from ${PARAMETERS_FILE}"
+          for key in $(jq -r 'keys_unsorted[]' "${PARAMETERS_FILE}"); do
+            value=$(jq -r ".\"$key\"" "${PARAMETERS_FILE}")
+            echo "${key}=${value}" >> "$GITHUB_ENV"
+            echo "Set ${key}"
+          done
+
+      - name: Cloud Login
+        uses: ./.github/actions/cloud-login
+        with:
+          cloud: ${{ inputs.cloud }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          aws-region: ${{ env.AWS_REGION }}
+          aws-account-id: ${{ env.AWS_ACCOUNT_ID }}
+          eks-cluster: ${{ env.EKS_CLUSTER }}
+
+      ###################################################################
+      # HELM LINT + DRY RUN
+      ###################################################################
+      - name: Helm Lint + Dry Run
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXTRA_ARGS=()
+          if [ -n "${{ inputs.vaultImageRepository }}" ]; then
+            EXTRA_ARGS+=(--set image.repository="<<your specific value>>/${{ inputs.vaultImageRepository }}")
+          fi
+
+          helm lint "$CHART_DIR" -f "$VALUES_FILE" \
+            --set image.tag="${{ inputs.vaultImageTag }}" \
+            "${EXTRA_ARGS[@]}"
+
+          helm upgrade --install "$RELEASE_NAME" "$CHART_DIR" \
+            --namespace "$NAMESPACE" \
+            --create-namespace \
+            -f "$VALUES_FILE" \
+            --set image.tag="${{ inputs.vaultImageTag }}" \
+            "${EXTRA_ARGS[@]}" \
+            --dry-run
+
+          echo "Validation passed"
+
+      ###################################################################
+      # HELM DEPLOY
+      ###################################################################
+      - name: Helm Deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXTRA_ARGS=()
+          if [ -n "${{ inputs.vaultImageRepository }}" ]; then
+            EXTRA_ARGS+=(--set image.repository="<<your specific value>>/${{ inputs.vaultImageRepository }}")
+          fi
+
+          helm upgrade --install "$RELEASE_NAME" "$CHART_DIR" \
+            --namespace "$NAMESPACE" \
+            -f "$VALUES_FILE" \
+            --set image.tag="${{ inputs.vaultImageTag }}" \
+            "${EXTRA_ARGS[@]}" \
+            --wait \
+            --timeout 5m
+
+          echo "========================================"
+          echo "POST-DEPLOY STATUS"
+          echo "========================================"
+          kubectl get pods -n "$NAMESPACE" -l app=dpn-vault -o wide
+          kubectl get svc -n "$NAMESPACE" -l app=dpn-vault
+
+      ###################################################################
+      # POST-DEPLOY VERIFICATION
+      ###################################################################
+      - name: Vault Seal Status Check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VAULT_POD=$(kubectl get pod -n "$NAMESPACE" -l app=dpn-vault \
+            -o jsonpath='{.items[0].metadata.name}')
+
+          echo "Pod: $VAULT_POD"
+          kubectl exec -n "$NAMESPACE" "$VAULT_POD" -- \
+            sh -c 'VAULT_ADDR=http://127.0.0.1:8200 vault status || true'
+
+      ###################################################################
+      # CAPTURE DEPLOYED IMAGE DIGEST
+      ###################################################################
+      - name: Capture Deployed Image Digest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VAULT_DIGEST=$(kubectl get pods -n "$NAMESPACE" \
+            -l app=dpn-vault \
+            -o jsonpath='{.items[0].status.containerStatuses[0].imageID}')
+
+          if [ -z "$VAULT_DIGEST" ]; then
+            echo "::error::Could not resolve deployed vault image digest from pod status"
+            exit 1
+          fi
+
+          echo "Vault image digest: $VAULT_DIGEST"
+
+          mkdir -p "$GITHUB_WORKSPACE/deployed-digest"
+
+          {
+            echo "$VAULT_DIGEST"
+            echo "component=vault"
+            echo "environment=${{ inputs.environment }}"
+            echo "dpncluster=${{ inputs.cluster }}"
+            echo "imageTag=${{ inputs.vaultImageTag }}"
+          } > "$GITHUB_WORKSPACE/deployed-digest/vault-digest.txt"
+
+          echo "Digest written to $GITHUB_WORKSPACE/deployed-digest"
+
+      - name: Publish Deployed Image Digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployed-image-digest
+          path: deployed-digest/
